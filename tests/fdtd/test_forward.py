@@ -18,15 +18,19 @@ class TestForward:
     def setup_simulation_state(self):
         """Set up a basic simulation state for testing."""
         # Create mock arrays with appropriate shapes
-        E = jnp.ones((10, 10, 10, 3))  # 3D electric field
-        H = jnp.ones((10, 10, 10, 3))  # 3D magnetic field
-        psi_E = jnp.zeros((6, 10, 10, 10))  # 3D auxiliary electric field
-        psi_H = jnp.zeros((6, 10, 10, 10))  # 3D auxiliary magnetic field
-        alpha = jnp.zeros((3, 10, 10, 10))  # 3D alpha array
-        kappa = jnp.ones((3, 10, 10, 10))  # 3D kappa array
-        sigma = jnp.zeros((3, 10, 10, 10))  # 3D sigma array
-        inv_permittivities = jnp.ones((10, 10, 10))
-        inv_permeabilities = jnp.ones((10, 10, 10))
+        nx, ny, nz = 10, 10, 10
+        E = jnp.ones((nx, ny, nz, 3))  # 3D electric field
+        H = jnp.ones((nx, ny, nz, 3))  # 3D magnetic field
+        psi_E = jnp.zeros((6, nx, ny, nz))  # 3D auxiliary electric field
+        psi_H = jnp.zeros((6, nx, ny, nz))  # 3D auxiliary magnetic field
+        pml_a_E = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        pml_b_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        pml_a_H = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        pml_b_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        inv_kappa_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        inv_kappa_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        inv_permittivities = jnp.ones((nx, ny, nz))
+        inv_permeabilities = jnp.ones((nx, ny, nz))
 
         # Create mock detector states
         detector_states = {"detector1": Mock(spec=DetectorState)}
@@ -38,9 +42,12 @@ class TestForward:
             H=H,
             psi_E=psi_E,
             psi_H=psi_H,
-            alpha=alpha,
-            kappa=kappa,
-            sigma=sigma,
+            pml_a_E=pml_a_E,
+            pml_b_E=pml_b_E,
+            pml_a_H=pml_a_H,
+            pml_b_H=pml_b_H,
+            inv_kappa_E=inv_kappa_E,
+            inv_kappa_H=inv_kappa_H,
             inv_permittivities=inv_permittivities,
             inv_permeabilities=inv_permeabilities,
             detector_states=detector_states,
@@ -165,9 +172,12 @@ class TestForward:
                 H=arrays.H,
                 psi_E=arrays.psi_E,
                 psi_H=arrays.psi_H,
-                alpha=arrays.alpha,
-                kappa=arrays.kappa,
-                sigma=arrays.sigma,
+                pml_a_E=arrays.pml_a_E,
+                pml_b_E=arrays.pml_b_E,
+                pml_a_H=arrays.pml_a_H,
+                pml_b_H=arrays.pml_b_H,
+                inv_kappa_E=arrays.inv_kappa_E,
+                inv_kappa_H=arrays.inv_kappa_H,
                 inv_permittivities=arrays.inv_permittivities,
                 inv_permeabilities=arrays.inv_permeabilities,
                 detector_states=arrays.detector_states,
@@ -184,7 +194,7 @@ class TestForward:
             mock_forward.assert_called_once()
 
             # Check return values
-            assert len(result) == 12
+            assert len(result) == 15
             assert result[0] == 1  # time_step
             assert jnp.array_equal(result[1], arrays.E)  # E field
             assert jnp.array_equal(result[2], arrays.H)  # H field

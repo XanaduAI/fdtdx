@@ -287,15 +287,19 @@ class TestArrayContainer:
     def setup_method(self):
         """Set up test fixtures."""
         # Create mock arrays
-        self.E = jnp.ones((3, 10, 10, 10))
-        self.H = jnp.ones((3, 10, 10, 10))
-        self.psi_E = jnp.zeros((6, 10, 10, 10))
-        self.psi_H = jnp.zeros((6, 10, 10, 10))
-        self.alpha = jnp.zeros((3, 10, 10, 10))
-        self.kappa = jnp.ones((3, 10, 10, 10))
-        self.sigma = jnp.zeros((3, 10, 10, 10))
-        self.inv_permittivities = jnp.ones((3, 10, 10, 10))
-        self.inv_permeabilities = jnp.ones((3, 10, 10, 10))
+        nx, ny, nz = 10, 10, 10
+        self.E = jnp.ones((3, nx, ny, nz))
+        self.H = jnp.ones((3, nx, ny, nz))
+        self.psi_E = jnp.zeros((6, nx, ny, nz))
+        self.psi_H = jnp.zeros((6, nx, ny, nz))
+        self.pml_a_E = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        self.pml_b_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.pml_a_H = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        self.pml_b_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.inv_kappa_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.inv_kappa_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.inv_permittivities = jnp.ones((3, nx, ny, nz))
+        self.inv_permeabilities = jnp.ones((3, nx, ny, nz))
 
         # Create mock states
         self.detector_states = {"detector1": Mock(spec=DetectorState)}
@@ -306,9 +310,12 @@ class TestArrayContainer:
             H=self.H,
             psi_E=self.psi_E,
             psi_H=self.psi_H,
-            alpha=self.alpha,
-            kappa=self.kappa,
-            sigma=self.sigma,
+            pml_a_E=self.pml_a_E,
+            pml_b_E=self.pml_b_E,
+            pml_a_H=self.pml_a_H,
+            pml_b_H=self.pml_b_H,
+            inv_kappa_E=self.inv_kappa_E,
+            inv_kappa_H=self.inv_kappa_H,
             inv_permittivities=self.inv_permittivities,
             inv_permeabilities=self.inv_permeabilities,
             detector_states=self.detector_states,
@@ -334,9 +341,12 @@ class TestArrayContainer:
             H=self.H,
             psi_E=self.psi_E,
             psi_H=self.psi_H,
-            alpha=self.alpha,
-            kappa=self.kappa,
-            sigma=self.sigma,
+            pml_a_E=self.pml_a_E,
+            pml_b_E=self.pml_b_E,
+            pml_a_H=self.pml_a_H,
+            pml_b_H=self.pml_b_H,
+            inv_kappa_E=self.inv_kappa_E,
+            inv_kappa_H=self.inv_kappa_H,
             inv_permittivities=self.inv_permittivities,
             inv_permeabilities=self.inv_permeabilities,
             detector_states=self.detector_states,
@@ -361,15 +371,19 @@ class TestResetArrayContainer:
     def setup_method(self):
         """Set up test fixtures."""
         # Create mock arrays with non-zero values
-        self.E = jnp.ones((3, 5, 5, 5))
-        self.H = jnp.ones((3, 5, 5, 5))
-        self.psi_E = jnp.zeros((6, 5, 5, 5))
-        self.psi_H = jnp.zeros((6, 5, 5, 5))
-        self.alpha = jnp.zeros((3, 5, 5, 5))
-        self.kappa = jnp.ones((3, 5, 5, 5))
-        self.sigma = jnp.zeros((3, 5, 5, 5))
-        self.inv_permittivities = jnp.ones((3, 5, 5, 5))
-        self.inv_permeabilities = jnp.ones((3, 5, 5, 5))
+        nx, ny, nz = 5, 5, 5
+        self.E = jnp.ones((3, nx, ny, nz))
+        self.H = jnp.ones((3, nx, ny, nz))
+        self.psi_E = jnp.zeros((6, nx, ny, nz))
+        self.psi_H = jnp.zeros((6, nx, ny, nz))
+        self.pml_a_E = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        self.pml_b_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.pml_a_H = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        self.pml_b_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.inv_kappa_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.inv_kappa_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        self.inv_permittivities = jnp.ones((3, nx, ny, nz))
+        self.inv_permeabilities = jnp.ones((3, nx, ny, nz))
 
         # Create mock states
         self.detector_states = {"detector1": {"data": jnp.ones(10)}}
@@ -380,9 +394,12 @@ class TestResetArrayContainer:
             H=self.H,
             psi_E=self.psi_E,
             psi_H=self.psi_H,
-            alpha=self.alpha,
-            kappa=self.kappa,
-            sigma=self.sigma,
+            pml_a_E=self.pml_a_E,
+            pml_b_E=self.pml_b_E,
+            pml_a_H=self.pml_a_H,
+            pml_b_H=self.pml_b_H,
+            inv_kappa_E=self.inv_kappa_E,
+            inv_kappa_H=self.inv_kappa_H,
             inv_permittivities=self.inv_permittivities,
             inv_permeabilities=self.inv_permeabilities,
             detector_states=self.detector_states,

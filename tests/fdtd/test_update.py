@@ -101,22 +101,26 @@ class TestUpdateE:
     def setup(self):
         """Setup common test data"""
         # Create mock arrays with compatible shapes
+        nx, ny, nz = 10, 10, 10
         arrays = MockArrayContainer(
-            E=jnp.ones((3, 10, 10, 10)),
-            H=jnp.zeros((3, 10, 10, 10)),
-            psi_E=jnp.zeros((6, 10, 10, 10)),
-            psi_H=jnp.zeros((6, 10, 10, 10)),
-            alpha=jnp.zeros((3, 10, 10, 10)),
-            kappa=jnp.ones((3, 10, 10, 10)),
-            sigma=jnp.zeros((3, 10, 10, 10)),
-            inv_permittivities=jnp.ones((3, 10, 10, 10)),
-            inv_permeabilities=jnp.ones((3, 10, 10, 10)),
+            E=jnp.ones((3, nx, ny, nz)),
+            H=jnp.zeros((3, nx, ny, nz)),
+            psi_E=jnp.zeros((6, nx, ny, nz)),
+            psi_H=jnp.zeros((6, nx, ny, nz)),
+            pml_a_E=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            pml_a_H=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_permittivities=jnp.ones((3, nx, ny, nz)),
+            inv_permeabilities=jnp.ones((3, nx, ny, nz)),
             electric_conductivity=None,
         )
 
         # Mock the curl_H function to return compatible shape
         with patch("fdtdx.fdtd.update.curl_H") as mock_curl:
-            mock_curl.return_value = (jnp.zeros((3, 10, 10, 10)), jnp.zeros((6, 10, 10, 10)))
+            mock_curl.return_value = (jnp.zeros((3, nx, ny, nz)), jnp.zeros((6, nx, ny, nz)))
 
             # Create mock objects
             mock_objects = Mock()
@@ -178,22 +182,26 @@ class TestUpdateEReverse:
     def setup(self):
         """Setup common test data"""
         # Create mock arrays with compatible shapes
+        nx, ny, nz = 10, 10, 10
         arrays = MockArrayContainer(
-            E=jnp.ones((3, 10, 10, 10)),
-            H=jnp.zeros((3, 10, 10, 10)),
-            psi_E=jnp.zeros((6, 10, 10, 10)),
-            psi_H=jnp.zeros((6, 10, 10, 10)),
-            alpha=jnp.zeros((3, 10, 10, 10)),
-            kappa=jnp.ones((3, 10, 10, 10)),
-            sigma=jnp.zeros((3, 10, 10, 10)),
-            inv_permittivities=jnp.ones((3, 10, 10, 10)),
-            inv_permeabilities=jnp.ones((3, 10, 10, 10)),
+            E=jnp.ones((3, nx, ny, nz)),
+            H=jnp.zeros((3, nx, ny, nz)),
+            psi_E=jnp.zeros((6, nx, ny, nz)),
+            psi_H=jnp.zeros((6, nx, ny, nz)),
+            pml_a_E=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            pml_a_H=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_permittivities=jnp.ones((3, nx, ny, nz)),
+            inv_permeabilities=jnp.ones((3, nx, ny, nz)),
             electric_conductivity=None,
         )
 
         # Mock the curl_H function to return compatible shape
         with patch("fdtdx.fdtd.update.curl_H") as mock_curl:
-            mock_curl.return_value = (jnp.zeros((3, 10, 10, 10)), jnp.zeros((6, 10, 10, 10)))
+            mock_curl.return_value = (jnp.zeros((3, nx, ny, nz)), jnp.zeros((6, nx, ny, nz)))
 
             # Create mock objects
             mock_objects = Mock()
@@ -253,22 +261,26 @@ class TestUpdateH:
     def setup(self):
         """Setup common test data"""
         # Create mock arrays with compatible shapes
+        nx, ny, nz = 10, 10, 10
         arrays = MockArrayContainer(
-            H=jnp.ones((3, 10, 10, 10)),
-            E=jnp.zeros((3, 10, 10, 10)),
-            psi_E=jnp.zeros((6, 10, 10, 10)),
-            psi_H=jnp.zeros((6, 10, 10, 10)),
-            alpha=jnp.zeros((3, 10, 10, 10)),
-            kappa=jnp.ones((3, 10, 10, 10)),
-            sigma=jnp.zeros((3, 10, 10, 10)),
-            inv_permeabilities=jnp.ones((3, 10, 10, 10)),
+            H=jnp.ones((3, nx, ny, nz)),
+            E=jnp.zeros((3, nx, ny, nz)),
+            psi_E=jnp.zeros((6, nx, ny, nz)),
+            psi_H=jnp.zeros((6, nx, ny, nz)),
+            pml_a_E=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            pml_a_H=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_permeabilities=jnp.ones((3, nx, ny, nz)),
             magnetic_conductivity=None,
-            inv_permittivities=jnp.ones((3, 10, 10, 10)),
+            inv_permittivities=jnp.ones((3, nx, ny, nz)),
         )
 
         # Mock the curl_E function to return compatible shape
         with patch("fdtdx.fdtd.update.curl_E") as mock_curl:
-            mock_curl.return_value = (jnp.zeros((3, 10, 10, 10)), jnp.zeros((6, 10, 10, 10)))
+            mock_curl.return_value = (jnp.zeros((3, nx, ny, nz)), jnp.zeros((6, nx, ny, nz)))
 
             # Create mock objects
             mock_objects = Mock()
@@ -330,22 +342,26 @@ class TestUpdateHReverse:
     def setup(self):
         """Setup common test data"""
         # Create mock arrays with compatible shapes
+        nx, ny, nz = 10, 10, 10
         arrays = MockArrayContainer(
-            H=jnp.ones((3, 10, 10, 10)),
-            E=jnp.zeros((3, 10, 10, 10)),
-            psi_E=jnp.zeros((6, 10, 10, 10)),
-            psi_H=jnp.zeros((6, 10, 10, 10)),
-            alpha=jnp.zeros((3, 10, 10, 10)),
-            kappa=jnp.ones((3, 10, 10, 10)),
-            sigma=jnp.zeros((3, 10, 10, 10)),
-            inv_permittivities=jnp.ones((3, 10, 10, 10)),
-            inv_permeabilities=jnp.ones((3, 10, 10, 10)),
+            H=jnp.ones((3, nx, ny, nz)),
+            E=jnp.zeros((3, nx, ny, nz)),
+            psi_E=jnp.zeros((6, nx, ny, nz)),
+            psi_H=jnp.zeros((6, nx, ny, nz)),
+            pml_a_E=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            pml_a_H=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_permittivities=jnp.ones((3, nx, ny, nz)),
+            inv_permeabilities=jnp.ones((3, nx, ny, nz)),
             magnetic_conductivity=None,
         )
 
         # Mock the curl_E function to return compatible shape
         with patch("fdtdx.fdtd.update.curl_E") as mock_curl:
-            mock_curl.return_value = (jnp.zeros((3, 10, 10, 10)), jnp.zeros((6, 10, 10, 10)))
+            mock_curl.return_value = (jnp.zeros((3, nx, ny, nz)), jnp.zeros((6, nx, ny, nz)))
 
             # Create mock objects
             mock_objects = Mock()
@@ -405,29 +421,33 @@ class TestUpdateDetectorStates:
     def setup(self):
         """Setup common test data"""
         # Create mock arrays
+        nx, ny, nz = 10, 10, 10
         arrays = MockArrayContainer(
-            E=jnp.ones((3, 10, 10, 10)),
-            H=jnp.zeros((3, 10, 10, 10)),
-            psi_E=jnp.zeros((6, 10, 10, 10)),
-            psi_H=jnp.zeros((6, 10, 10, 10)),
-            alpha=jnp.zeros((3, 10, 10, 10)),
-            kappa=jnp.ones((3, 10, 10, 10)),
-            sigma=jnp.zeros((3, 10, 10, 10)),
-            inv_permittivities=jnp.ones((3, 10, 10, 10)),
-            inv_permeabilities=jnp.ones((3, 10, 10, 10)),
+            E=jnp.ones((3, nx, ny, nz)),
+            H=jnp.zeros((3, nx, ny, nz)),
+            psi_E=jnp.zeros((6, nx, ny, nz)),
+            psi_H=jnp.zeros((6, nx, ny, nz)),
+            pml_a_E=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            pml_a_H=(jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz)),
+            pml_b_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_E=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_kappa_H=(jnp.ones(nx), jnp.ones(ny), jnp.ones(nz)),
+            inv_permittivities=jnp.ones((3, nx, ny, nz)),
+            inv_permeabilities=jnp.ones((3, nx, ny, nz)),
             detector_states={},
         )
 
         # Mock the interpolate_fields function
         with patch("fdtdx.fdtd.update.interpolate_fields") as mock_interpolate:
-            mock_interpolate.return_value = (jnp.ones((3, 10, 10, 10)), jnp.zeros((3, 10, 10, 10)))
+            mock_interpolate.return_value = (jnp.ones((3, nx, ny, nz)), jnp.zeros((3, nx, ny, nz)))
 
             # Create mock objects
             mock_objects = Mock()
             mock_objects.boundary_objects = []
 
             # Create H_prev array
-            H_prev = jnp.zeros((3, 10, 10, 10))
+            H_prev = jnp.zeros((3, nx, ny, nz))
 
             yield arrays, mock_objects, H_prev
 

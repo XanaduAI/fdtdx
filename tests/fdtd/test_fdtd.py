@@ -26,19 +26,26 @@ def dummy_arrays():
     auxiliary_field_shape = (6, nx, ny, nz)  # (components, nx, ny, nz)
     mat_shape = (3, nx, ny, nz)  # scalar per voxel
 
-    # PML arrays are 1D tuples: (alpha_E_x, alpha_E_y, alpha_E_z, alpha_H_x, alpha_H_y, alpha_H_z)
-    alpha = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz), jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
-    kappa = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz), jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
-    sigma = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz), jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+    # Precomputed PML coefficients: a, b for E and H fields
+    # For testing, use b=1 (no decay) and a=0 (no update)
+    pml_a_E = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+    pml_b_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+    pml_a_H = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+    pml_b_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+    inv_kappa_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+    inv_kappa_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
 
     return ArrayContainer(
         E=jnp.zeros(field_shape),
         H=jnp.zeros(field_shape),
         psi_E=jnp.zeros(auxiliary_field_shape),
         psi_H=jnp.zeros(auxiliary_field_shape),
-        alpha=alpha,
-        kappa=kappa,
-        sigma=sigma,
+        pml_a_E=pml_a_E,
+        pml_b_E=pml_b_E,
+        pml_a_H=pml_a_H,
+        pml_b_H=pml_b_H,
+        inv_kappa_E=inv_kappa_E,
+        inv_kappa_H=inv_kappa_H,
         inv_permittivities=jnp.ones(mat_shape),
         inv_permeabilities=jnp.ones(mat_shape),
         detector_states={},

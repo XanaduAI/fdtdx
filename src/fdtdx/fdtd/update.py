@@ -54,12 +54,11 @@ def update_E(
     c = config.courant_number
     sigma_E = arrays.electric_conductivity
     curl, psi_E = curl_H(
-        config,
         arrays.H,
         arrays.psi_E,
-        arrays.alpha,
-        arrays.kappa,
-        arrays.sigma,
+        arrays.pml_a_E,
+        arrays.pml_b_E,
+        arrays.inv_kappa_H,
         simulate_boundaries,
         get_periodic_axes(objects),
     )
@@ -146,7 +145,7 @@ def update_E_reverse(
 
     # Get periodic axes for curl operation
     periodic_axes = get_periodic_axes(objects)
-    curl, _ = curl_H(config, arrays.H, arrays.psi_E, arrays.alpha, arrays.kappa, arrays.sigma, False, periodic_axes)
+    curl, _ = curl_H(arrays.H, arrays.psi_E, arrays.pml_a_E, arrays.pml_b_E, arrays.inv_kappa_H, False, periodic_axes)
     inv_eps = arrays.inv_permittivities
     c = config.courant_number
     sigma_E = arrays.electric_conductivity  # shape: (3, Nx, Ny, Nz) or None
@@ -197,12 +196,11 @@ def update_H(
     c = config.courant_number
     sigma_H = arrays.magnetic_conductivity
     curl, psi_H = curl_E(
-        config,
         arrays.E,
         arrays.psi_H,
-        arrays.alpha,
-        arrays.kappa,
-        arrays.sigma,
+        arrays.pml_a_H,
+        arrays.pml_b_H,
+        arrays.inv_kappa_E,
         simulate_boundaries,
         get_periodic_axes(objects),
     )
@@ -292,7 +290,7 @@ def update_H_reverse(
     # Get periodic axes for curl operation
     periodic_axes = get_periodic_axes(objects)
 
-    curl, _ = curl_E(config, arrays.E, arrays.psi_H, arrays.alpha, arrays.kappa, arrays.sigma, False, periodic_axes)
+    curl, _ = curl_E(arrays.E, arrays.psi_H, arrays.pml_a_H, arrays.pml_b_H, arrays.inv_kappa_E, False, periodic_axes)
     inv_mu = arrays.inv_permeabilities
 
     c = config.courant_number

@@ -229,20 +229,33 @@ class ArrayContainer(TreeClass):
     #: Auxiliary magnetic field array.
     psi_H: jax.Array
 
-    #: Alpha arrays for PML calculations.
-    #: Tuple of 6 1D arrays: (alpha_E_x, alpha_E_y, alpha_E_z, alpha_H_x, alpha_H_y, alpha_H_z)
+    #: Precomputed PML 'a' coefficients for E-field update.
+    #: Tuple of 3 1D arrays: (a_E_x, a_E_y, a_E_z)
     #: where each array varies only along its respective axis (x, y, or z).
-    alpha: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+    pml_a_E: tuple[jax.Array, jax.Array, jax.Array]
 
-    #: Kappa arrays for PML calculations.
-    #: Tuple of 6 1D arrays: (kappa_E_x, kappa_E_y, kappa_E_z, kappa_H_x, kappa_H_y, kappa_H_z)
+    #: Precomputed PML 'b' coefficients for E-field update.
+    #: Tuple of 3 1D arrays: (b_E_x, b_E_y, b_E_z)
     #: where each array varies only along its respective axis (x, y, or z).
-    kappa: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+    pml_b_E: tuple[jax.Array, jax.Array, jax.Array]
 
-    #: Sigma arrays for PML calculations.
-    #: Tuple of 6 1D arrays: (sigma_E_x, sigma_E_y, sigma_E_z, sigma_H_x, sigma_H_y, sigma_H_z)
+    #: Precomputed PML 'a' coefficients for H-field update.
+    #: Tuple of 3 1D arrays: (a_H_x, a_H_y, a_H_z)
     #: where each array varies only along its respective axis (x, y, or z).
-    sigma: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+    pml_a_H: tuple[jax.Array, jax.Array, jax.Array]
+
+    #: Precomputed PML 'b' coefficients for H-field update.
+    #: Tuple of 3 1D arrays: (b_H_x, b_H_y, b_H_z)
+    #: where each array varies only along its respective axis (x, y, or z).
+    pml_b_H: tuple[jax.Array, jax.Array, jax.Array]
+
+    #: Precomputed inverse kappa for E-field curl calculation.
+    #: Tuple of 3 1D arrays: (inv_kappa_E_x, inv_kappa_E_y, inv_kappa_E_z)
+    inv_kappa_E: tuple[jax.Array, jax.Array, jax.Array]
+
+    #: Precomputed inverse kappa for H-field curl calculation.
+    #: Tuple of 3 1D arrays: (inv_kappa_H_x, inv_kappa_H_y, inv_kappa_H_z)
+    inv_kappa_H: tuple[jax.Array, jax.Array, jax.Array]
 
     #: Inverse permittivity values array.
     inv_permittivities: jax.Array

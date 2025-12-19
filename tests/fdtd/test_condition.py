@@ -19,15 +19,19 @@ class TestCondition:
     def setup_simulation_state(self):
         """Set up a basic simulation state for testing."""
         # Create dummy arrays with appropriate shapes
-        E = jnp.ones((3, 10, 10, 10))  # 3D electric field
-        H = jnp.ones((3, 10, 10, 10))  # 3D magnetic field
-        psi_E = jnp.zeros((6, 10, 10, 10))  # 3D auxiliary electric field
-        psi_H = jnp.zeros((6, 10, 10, 10))  # 3D auxiliary magnetic field
-        alpha = jnp.zeros((3, 10, 10, 10))  # 3D alpha array
-        kappa = jnp.ones((3, 10, 10, 10))  # 3D kappa array
-        sigma = jnp.zeros((3, 10, 10, 10))  # 3D sigma array
-        inv_permittivities = jnp.ones((10, 10, 10))
-        inv_permeabilities = jnp.ones((10, 10, 10))
+        nx, ny, nz = 10, 10, 10
+        E = jnp.ones((3, nx, ny, nz))  # 3D electric field
+        H = jnp.ones((3, nx, ny, nz))  # 3D magnetic field
+        psi_E = jnp.zeros((6, nx, ny, nz))  # 3D auxiliary electric field
+        psi_H = jnp.zeros((6, nx, ny, nz))  # 3D auxiliary magnetic field
+        pml_a_E = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        pml_b_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        pml_a_H = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+        pml_b_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        inv_kappa_E = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        inv_kappa_H = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+        inv_permittivities = jnp.ones((nx, ny, nz))
+        inv_permeabilities = jnp.ones((nx, ny, nz))
 
         # Create mock detector states
         detector_states = {"detector1": DetectorState()}
@@ -38,9 +42,12 @@ class TestCondition:
             H=H,
             psi_E=psi_E,
             psi_H=psi_H,
-            alpha=alpha,
-            kappa=kappa,
-            sigma=sigma,
+            pml_a_E=pml_a_E,
+            pml_b_E=pml_b_E,
+            pml_a_H=pml_a_H,
+            pml_b_H=pml_b_H,
+            inv_kappa_E=inv_kappa_E,
+            inv_kappa_H=inv_kappa_H,
             inv_permittivities=inv_permittivities,
             inv_permeabilities=inv_permeabilities,
             detector_states=detector_states,

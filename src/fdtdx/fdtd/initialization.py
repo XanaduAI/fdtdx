@@ -437,6 +437,39 @@ def _init_arrays(
                 electric_conductivity = result.get("electric_conductivity", electric_conductivity)
                 magnetic_conductivity = result.get("magnetic_conductivity", magnetic_conductivity)
 
+    # Precompute PML coefficients a and b from alpha, kappa, sigma
+    # These are computed once and reused every time step, saving computation and memory
+    from fdtdx.constants import c as c0
+    from fdtdx.constants import eps0
+
+    pml_factor = -config.courant_number * config.resolution / c0 / eps0
+
+    def compute_pml_coefficients(alpha_arr, kappa_arr, sigma_arr):
+        """Compute PML a and b coefficients from alpha, kappa, sigma."""
+        b = jnp.expm1(pml_factor * (sigma_arr / kappa_arr + alpha_arr)) + 1
+        a = (b - 1.0) * sigma_arr / (sigma_arr + alpha_arr * kappa_arr) / kappa_arr
+        a = jnp.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+        return a, b
+
+    # Compute coefficients for E-field (indices 0, 1, 2)
+    a_E_x, b_E_x = compute_pml_coefficients(alpha[0], kappa[0], sigma[0])
+    a_E_y, b_E_y = compute_pml_coefficients(alpha[1], kappa[1], sigma[1])
+    a_E_z, b_E_z = compute_pml_coefficients(alpha[2], kappa[2], sigma[2])
+
+    # Compute coefficients for H-field (indices 3, 4, 5)
+    a_H_x, b_H_x = compute_pml_coefficients(alpha[3], kappa[3], sigma[3])
+    a_H_y, b_H_y = compute_pml_coefficients(alpha[4], kappa[4], sigma[4])
+    a_H_z, b_H_z = compute_pml_coefficients(alpha[5], kappa[5], sigma[5])
+
+    pml_a_E = (a_E_x, a_E_y, a_E_z)
+    pml_b_E = (b_E_x, b_E_y, b_E_z)
+    pml_a_H = (a_H_x, a_H_y, a_H_z)
+    pml_b_H = (b_H_x, b_H_y, b_H_z)
+
+    # Precompute inverse kappa for curl calculations
+    inv_kappa_E = (1.0 / kappa[0], 1.0 / kappa[1], 1.0 / kappa[2])
+    inv_kappa_H = (1.0 / kappa[3], 1.0 / kappa[4], 1.0 / kappa[5])
+
     # interfaces
     recording_state = None
     if config.gradient_config is not None and config.gradient_config.recorder is not None:
@@ -463,9 +496,12 @@ def _init_arrays(
         H=H,
         psi_E=psi_E,
         psi_H=psi_H,
-        alpha=alpha,
-        kappa=kappa,
-        sigma=sigma,
+        pml_a_E=pml_a_E,
+        pml_b_E=pml_b_E,
+        pml_a_H=pml_a_H,
+        pml_b_H=pml_b_H,
+        inv_kappa_E=inv_kappa_E,
+        inv_kappa_H=inv_kappa_H,
         inv_permittivities=inv_permittivities,
         inv_permeabilities=inv_permeabilities,
         detector_states=detector_states,
