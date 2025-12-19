@@ -73,9 +73,10 @@ def test_curl_E_uniform_field():
     """Test curl_E with uniform electric field (should give zero curl)."""
     E = jnp.ones((3, 5, 5, 5))
     psi_H = jnp.zeros((6, 5, 5, 5))
-    alpha = jnp.zeros((6, 5, 5, 5))
-    kappa = jnp.ones((6, 5, 5, 5))
-    sigma = jnp.zeros((6, 5, 5, 5))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5))
+    kappa = (jnp.ones(5), jnp.ones(5), jnp.ones(5), jnp.ones(5), jnp.ones(5), jnp.ones(5))
+    sigma = (jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -107,9 +108,10 @@ def test_curl_E_linear_field():
         axis=0,
     )
     psi_H = jnp.zeros((6, 6, 6, 6))
-    alpha = jnp.zeros((6, 6, 6, 6))
-    kappa = jnp.ones((6, 6, 6, 6))
-    sigma = jnp.zeros((6, 6, 6, 6))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6))
+    kappa = (jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6))
+    sigma = (jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -142,9 +144,10 @@ def test_curl_E_periodic_boundaries():
 
     E = jnp.stack([jnp.sin(Y), jnp.cos(X), jnp.sin(Z)], axis=0)
     psi_H = jnp.zeros((6, 8, 8, 8))
-    alpha = jnp.zeros((6, 8, 8, 8))
-    kappa = jnp.ones((6, 8, 8, 8))
-    sigma = jnp.zeros((6, 8, 8, 8))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8))
+    kappa = (jnp.ones(8), jnp.ones(8), jnp.ones(8), jnp.ones(8), jnp.ones(8), jnp.ones(8))
+    sigma = (jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -161,9 +164,10 @@ def test_curl_E_zero_field():
     """Test curl_E with zero electric field."""
     E = jnp.zeros((3, 4, 4, 4))
     psi_H = jnp.zeros((6, 4, 4, 4))
-    alpha = jnp.zeros((6, 4, 4, 4))
-    kappa = jnp.ones((6, 4, 4, 4))
-    sigma = jnp.zeros((6, 4, 4, 4))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4))
+    kappa = (jnp.ones(4), jnp.ones(4), jnp.ones(4), jnp.ones(4), jnp.ones(4), jnp.ones(4))
+    sigma = (jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -188,9 +192,10 @@ def test_curl_H_uniform_field():
     """Test curl_H with uniform magnetic field (should give zero curl)."""
     H = jnp.ones((3, 5, 5, 5)) * 2.0
     psi_E = jnp.zeros((6, 5, 5, 5))
-    alpha = jnp.zeros((6, 5, 5, 5))
-    kappa = jnp.ones((6, 5, 5, 5))
-    sigma = jnp.zeros((6, 5, 5, 5))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5))
+    kappa = (jnp.ones(5), jnp.ones(5), jnp.ones(5), jnp.ones(5), jnp.ones(5), jnp.ones(5))
+    sigma = (jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5), jnp.zeros(5))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -221,9 +226,10 @@ def test_curl_H_linear_field():
         axis=0,
     )
     psi_E = jnp.zeros((6, 6, 6, 6))
-    alpha = jnp.zeros((6, 6, 6, 6))
-    kappa = jnp.ones((6, 6, 6, 6))
-    sigma = jnp.zeros((6, 6, 6, 6))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6))
+    kappa = (jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6))
+    sigma = (jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -247,9 +253,10 @@ def test_curl_H_periodic_boundaries():
 
     H = jnp.stack([jnp.cos(Y), jnp.sin(X), jnp.cos(Z)], axis=0)
     psi_E = jnp.zeros((6, 8, 8, 8))
-    alpha = jnp.zeros((6, 8, 8, 8))
-    kappa = jnp.ones((6, 8, 8, 8))
-    sigma = jnp.zeros((6, 8, 8, 8))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8))
+    kappa = (jnp.ones(8), jnp.ones(8), jnp.ones(8), jnp.ones(8), jnp.ones(8), jnp.ones(8))
+    sigma = (jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8), jnp.zeros(8))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -266,9 +273,10 @@ def test_curl_H_zero_field():
     """Test curl_H with zero magnetic field."""
     H = jnp.zeros((3, 4, 4, 4))
     psi_E = jnp.zeros((6, 4, 4, 4))
-    alpha = jnp.zeros((6, 4, 4, 4))
-    kappa = jnp.ones((6, 4, 4, 4))
-    sigma = jnp.zeros((6, 4, 4, 4))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4))
+    kappa = (jnp.ones(4), jnp.ones(4), jnp.ones(4), jnp.ones(4), jnp.ones(4), jnp.ones(4))
+    sigma = (jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4), jnp.zeros(4))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,
@@ -298,9 +306,10 @@ def test_curl_reciprocity():
 
     psi_E = jnp.zeros((6, 6, 6, 6))
     psi_H = jnp.zeros((6, 6, 6, 6))
-    alpha = jnp.zeros((6, 6, 6, 6))
-    kappa = jnp.ones((6, 6, 6, 6))
-    sigma = jnp.zeros((6, 6, 6, 6))
+    # Use 1D tuple format for PML arrays
+    alpha = (jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6))
+    kappa = (jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6), jnp.ones(6))
+    sigma = (jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6), jnp.zeros(6))
     config = SimulationConfig(
         time=400e-15,
         resolution=1.0,

@@ -20,19 +20,25 @@ class DummySimulationObject(SimulationObject):
 
 @pytest.fixture
 def dummy_arrays():
-    field_shape = (3, 2, 2, 2)  # (components, nx, ny, nz)
+    nx, ny, nz = 2, 2, 2
+    field_shape = (3, nx, ny, nz)  # (components, nx, ny, nz)
 
-    auxiliary_field_shape = (6, 2, 2, 2)  # (components, nx, ny, nz)
-    mat_shape = (3, 2, 2, 2)  # scalar per voxel
+    auxiliary_field_shape = (6, nx, ny, nz)  # (components, nx, ny, nz)
+    mat_shape = (3, nx, ny, nz)  # scalar per voxel
+
+    # PML arrays are 1D tuples: (alpha_E_x, alpha_E_y, alpha_E_z, alpha_H_x, alpha_H_y, alpha_H_z)
+    alpha = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz), jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
+    kappa = (jnp.ones(nx), jnp.ones(ny), jnp.ones(nz), jnp.ones(nx), jnp.ones(ny), jnp.ones(nz))
+    sigma = (jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz), jnp.zeros(nx), jnp.zeros(ny), jnp.zeros(nz))
 
     return ArrayContainer(
         E=jnp.zeros(field_shape),
         H=jnp.zeros(field_shape),
         psi_E=jnp.zeros(auxiliary_field_shape),
         psi_H=jnp.zeros(auxiliary_field_shape),
-        alpha=jnp.zeros(field_shape),
-        kappa=jnp.ones(field_shape),
-        sigma=jnp.zeros(field_shape),
+        alpha=alpha,
+        kappa=kappa,
+        sigma=sigma,
         inv_permittivities=jnp.ones(mat_shape),
         inv_permeabilities=jnp.ones(mat_shape),
         detector_states={},

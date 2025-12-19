@@ -130,7 +130,8 @@ class PerfectlyMatchedLayer(BaseBoundary):
             dtype: Data type for the array
 
         Returns:
-            jax.Array: Graded profile array with shape self.grid_shape
+            tuple[jax.Array, jax.Array]: 1D profile arrays (profileE_1d, profileH_1d)
+                with shape (thickness,) for the PML region.
         """
         L = self.thickness  # Total thickness of PML
 
@@ -149,36 +150,30 @@ class PerfectlyMatchedLayer(BaseBoundary):
         profileE_1d = value_start + (value_end - value_start) * jnp.power(dE / L, order)
         profileH_1d = value_start + (value_end - value_start) * jnp.power(dH / L, order)
 
-        # Create shape matching PML region with grading only along self.axis
-        shape = [1, 1, 1]
-        shape[self.axis] = L
-        profileE_reshaped = profileE_1d.reshape(shape)
-        profileH_reshaped = profileH_1d.reshape(shape)
-        # Broadcast to full grid_shape
-        profileE = jnp.broadcast_to(profileE_reshaped, self.grid_shape)
-        profileH = jnp.broadcast_to(profileH_reshaped, self.grid_shape)
-
-        return profileE, profileH
+        return profileE_1d, profileH_1d
 
     def modify_arrays(
         self,
-        alpha: jax.Array,
-        kappa: jax.Array,
-        sigma: jax.Array,
+        alpha: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+        kappa: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+        sigma: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
         electric_conductivity,
         magnetic_conductivity,
-    ) -> dict[str, jax.Array]:
+    ) -> dict[str, tuple[jax.Array, ...] | jax.Array | None]:
         """Modifies simulation arrays to include PML parameters.
 
         Args:
-            alpha: Alpha array for PML calculations (shape: (3, *volume_shape))
-            kappa: Kappa array for PML calculations (shape: (3, *volume_shape))
-            sigma: Sigma array for PML calculations (shape: (3, *volume_shape))
+            alpha: Tuple of 6 1D alpha arrays for PML calculations
+                   (alpha_E_x, alpha_E_y, alpha_E_z, alpha_H_x, alpha_H_y, alpha_H_z)
+            kappa: Tuple of 6 1D kappa arrays for PML calculations
+                   (kappa_E_x, kappa_E_y, kappa_E_z, kappa_H_x, kappa_H_y, kappa_H_z)
+            sigma: Tuple of 6 1D sigma arrays for PML calculations
+                   (sigma_E_x, sigma_E_y, sigma_E_z, sigma_H_x, sigma_H_y, sigma_H_z)
             electric_conductivity: Electric conductivity array (shape: volume_shape)
             magnetic_conductivity: Magnetic conductivity array (shape: volume_shape)
 
         Returns:
-            dict: Dictionary with modified 'alpha', 'kappa', and 'sigma' arrays
+            dict: Dictionary with modified 'alpha', 'kappa', and 'sigma' tuples
         """
 
         assert self.alpha_start is not None, "alpha_start should be set by __post_init__"
@@ -193,41 +188,51 @@ class PerfectlyMatchedLayer(BaseBoundary):
 
         dtype = self._config.dtype
 
-        # Compute PML parameters using polynomial grading
-        sigma_E, sigma_H = self._compute_pml_profile(
+        # Compute PML parameters using polynomial grading (1D profiles)
+        sigma_E_1d, sigma_H_1d = self._compute_pml_profile(
             value_start=self.sigma_start,
             value_end=self.sigma_end,
             order=self.sigma_order,
             dtype=dtype,
         )
 
-        kappa_E, kappa_H = self._compute_pml_profile(
+        kappa_E_1d, kappa_H_1d = self._compute_pml_profile(
             value_start=self.kappa_start,
             value_end=self.kappa_end,
             order=self.kappa_order,
             dtype=dtype,
         )
 
-        alpha_E, alpha_H = self._compute_pml_profile(
+        alpha_E_1d, alpha_H_1d = self._compute_pml_profile(
             value_start=self.alpha_start,
             value_end=self.alpha_end,
             order=self.alpha_order,
             dtype=dtype,
         )
 
-        # Update arrays in the PML region
-        # The PML parameters vary along self.axis, so we need to broadcast them correctly
-        alpha = alpha.at[self.axis, *self.grid_slice].set(alpha_E)
-        kappa = kappa.at[self.axis, *self.grid_slice].set(kappa_E)
-        sigma = sigma.at[self.axis, *self.grid_slice].set(sigma_E)
-        alpha = alpha.at[self.axis + 3, *self.grid_slice].set(alpha_H)
-        kappa = kappa.at[self.axis + 3, *self.grid_slice].set(kappa_H)
-        sigma = sigma.at[self.axis + 3, *self.grid_slice].set(sigma_H)
+        # Get the 1D slice along the PML axis
+        axis_slice = self.grid_slice[self.axis]
+
+        # Update the 1D arrays for the PML region
+        # self.axis determines which component to update (0=x, 1=y, 2=z for E, +3 for H)
+        alpha_list = list(alpha)
+        kappa_list = list(kappa)
+        sigma_list = list(sigma)
+
+        # Update E-field components (indices 0, 1, 2)
+        alpha_list[self.axis] = alpha_list[self.axis].at[axis_slice].set(alpha_E_1d)
+        kappa_list[self.axis] = kappa_list[self.axis].at[axis_slice].set(kappa_E_1d)
+        sigma_list[self.axis] = sigma_list[self.axis].at[axis_slice].set(sigma_E_1d)
+
+        # Update H-field components (indices 3, 4, 5)
+        alpha_list[self.axis + 3] = alpha_list[self.axis + 3].at[axis_slice].set(alpha_H_1d)
+        kappa_list[self.axis + 3] = kappa_list[self.axis + 3].at[axis_slice].set(kappa_H_1d)
+        sigma_list[self.axis + 3] = sigma_list[self.axis + 3].at[axis_slice].set(sigma_H_1d)
 
         return {
-            "alpha": alpha,
-            "kappa": kappa,
-            "sigma": sigma,
+            "alpha": tuple(alpha_list),
+            "kappa": tuple(kappa_list),
+            "sigma": tuple(sigma_list),
             "electric_conductivity": electric_conductivity,
             "magnetic_conductivity": magnetic_conductivity,
         }

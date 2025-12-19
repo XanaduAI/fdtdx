@@ -78,9 +78,9 @@ def curl_E(
     config: SimulationConfig,
     E: jax.Array,
     psi_H: jax.Array,
-    alpha: jax.Array,
-    kappa: jax.Array,
-    sigma: jax.Array,
+    alpha: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    kappa: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    sigma: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
     simulate_boundaries: bool,
     periodic_axes: tuple[bool, bool, bool] = (False, False, False),
 ) -> tuple[jax.Array, jax.Array]:
@@ -98,12 +98,12 @@ def curl_E(
             Shape is (3, nx, ny, nz) for the 3 field components.
         psi_H (jax.Array): Auxiliary field for the magnetic field.
             Shape is (6, nx, ny, nz) for the 6 auxiliary fields.
-        alpha (jax.Array): Alpha parameter for the PML.
-            Shape is (6, nx, ny, nz).
-        kappa (jax.Array): Kappa parameter for the PML.
-            Shape is (6, nx, ny, nz).
-        sigma (jax.Array): Sigma parameter for the PML.
-            Shape is (6, nx, ny, nz).
+        alpha (tuple): Tuple of 6 1D alpha arrays for PML:
+            (alpha_E_x, alpha_E_y, alpha_E_z, alpha_H_x, alpha_H_y, alpha_H_z)
+        kappa (tuple): Tuple of 6 1D kappa arrays for PML:
+            (kappa_E_x, kappa_E_y, kappa_E_z, kappa_H_x, kappa_H_y, kappa_H_z)
+        sigma (tuple): Tuple of 6 1D sigma arrays for PML:
+            (sigma_E_x, sigma_E_y, sigma_E_z, sigma_H_x, sigma_H_y, sigma_H_z)
         simulate_boundaries (bool): Whether to simulate boundaries.
         periodic_axes (tuple[bool, bool, bool], optional): Tuple of booleans indicating which axes use periodic
             boundaries (periodic_x, periodic_y, periodic_z). Defaults to (False, False, False).
@@ -140,6 +140,25 @@ def curl_E(
     psi_Hzx = psi_H[4, :, :, :]
     psi_Hzy = psi_H[5, :, :, :]
 
+    # Reshape 1D arrays for broadcasting:
+    # - x-component arrays: (nx,) -> (nx, 1, 1)
+    # - y-component arrays: (ny,) -> (1, ny, 1)
+    # - z-component arrays: (nz,) -> (1, 1, nz)
+    alpha_H_x = alpha[3][:, None, None]
+    alpha_H_y = alpha[4][None, :, None]
+    alpha_H_z = alpha[5][None, None, :]
+    kappa_H_x = kappa[3][:, None, None]
+    kappa_H_y = kappa[4][None, :, None]
+    kappa_H_z = kappa[5][None, None, :]
+    sigma_H_x = sigma[3][:, None, None]
+    sigma_H_y = sigma[4][None, :, None]
+    sigma_H_z = sigma[5][None, None, :]
+
+    # Also reshape kappa for E-field (used in curl calculation)
+    kappa_E_x = kappa[0][:, None, None]
+    kappa_E_y = kappa[1][None, :, None]
+    kappa_E_z = kappa[2][None, None, :]
+
     if simulate_boundaries:
         # Get H-field PML coefficients
         b_x = (
@@ -148,7 +167,7 @@ def curl_E(
                 * config.resolution
                 / c0
                 / eps0
-                * (sigma[3, :, :, :] / kappa[3, :, :, :] + alpha[3, :, :, :])
+                * (sigma_H_x / kappa_H_x + alpha_H_x)
             )
             + 1
         )
@@ -158,7 +177,7 @@ def curl_E(
                 * config.resolution
                 / c0
                 / eps0
-                * (sigma[4, :, :, :] / kappa[4, :, :, :] + alpha[4, :, :, :])
+                * (sigma_H_y / kappa_H_y + alpha_H_y)
             )
             + 1
         )
@@ -168,28 +187,28 @@ def curl_E(
                 * config.resolution
                 / c0
                 / eps0
-                * (sigma[5, :, :, :] / kappa[5, :, :, :] + alpha[5, :, :, :])
+                * (sigma_H_z / kappa_H_z + alpha_H_z)
             )
             + 1
         )
 
         a_x = (
             (b_x - 1.0)
-            * sigma[3, :, :, :]
-            / (sigma[3, :, :, :] + alpha[3, :, :, :] * kappa[3, :, :, :])
-            / kappa[3, :, :, :]
+            * sigma_H_x
+            / (sigma_H_x + alpha_H_x * kappa_H_x)
+            / kappa_H_x
         )
         a_y = (
             (b_y - 1.0)
-            * sigma[4, :, :, :]
-            / (sigma[4, :, :, :] + alpha[4, :, :, :] * kappa[4, :, :, :])
-            / kappa[4, :, :, :]
+            * sigma_H_y
+            / (sigma_H_y + alpha_H_y * kappa_H_y)
+            / kappa_H_y
         )
         a_z = (
             (b_z - 1.0)
-            * sigma[5, :, :, :]
-            / (sigma[5, :, :, :] + alpha[5, :, :, :] * kappa[5, :, :, :])
-            / kappa[5, :, :, :]
+            * sigma_H_z
+            / (sigma_H_z + alpha_H_z * kappa_H_z)
+            / kappa_H_z
         )
 
         a_x = jnp.nan_to_num(a_x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -206,9 +225,9 @@ def curl_E(
 
     psi_H_updated = jnp.stack((psi_Hxy, psi_Hxz, psi_Hyz, psi_Hyx, psi_Hzx, psi_Hzy), axis=0)
 
-    curl_x = (1.0 / kappa[1, :, :, :] * dyEz + psi_Hxy) - (1.0 / kappa[2, :, :, :] * dzEy + psi_Hxz)
-    curl_y = (1.0 / kappa[2, :, :, :] * dzEx + psi_Hyz) - (1.0 / kappa[0, :, :, :] * dxEz + psi_Hyx)
-    curl_z = (1.0 / kappa[0, :, :, :] * dxEy + psi_Hzx) - (1.0 / kappa[1, :, :, :] * dyEx + psi_Hzy)
+    curl_x = (1.0 / kappa_E_y * dyEz + psi_Hxy) - (1.0 / kappa_E_z * dzEy + psi_Hxz)
+    curl_y = (1.0 / kappa_E_z * dzEx + psi_Hyz) - (1.0 / kappa_E_x * dxEz + psi_Hyx)
+    curl_z = (1.0 / kappa_E_x * dxEy + psi_Hzx) - (1.0 / kappa_E_y * dyEx + psi_Hzy)
     curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
 
     return curl, psi_H_updated
@@ -218,9 +237,9 @@ def curl_H(
     config: SimulationConfig,
     H: jax.Array,
     psi_E: jax.Array,
-    alpha: jax.Array,
-    kappa: jax.Array,
-    sigma: jax.Array,
+    alpha: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    kappa: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    sigma: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
     simulate_boundaries: bool,
     periodic_axes: tuple[bool, bool, bool] = (False, False, False),
 ) -> tuple[jax.Array, jax.Array]:
@@ -238,12 +257,12 @@ def curl_H(
             Shape is (3, nx, ny, nz) for the 3 field components.
         psi_E (jax.Array): Auxiliary field for the electric field.
             Shape is (6, nx, ny, nz) for the 6 auxiliary fields.
-        alpha (jax.Array): Alpha parameter for the PML.
-            Shape is (6, nx, ny, nz).
-        kappa (jax.Array): Kappa parameter for the PML.
-            Shape is (6, nx, ny, nz).
-        sigma (jax.Array): Sigma parameter for the PML.
-            Shape is (6, nx, ny, nz).
+        alpha (tuple): Tuple of 6 1D alpha arrays for PML:
+            (alpha_E_x, alpha_E_y, alpha_E_z, alpha_H_x, alpha_H_y, alpha_H_z)
+        kappa (tuple): Tuple of 6 1D kappa arrays for PML:
+            (kappa_E_x, kappa_E_y, kappa_E_z, kappa_H_x, kappa_H_y, kappa_H_z)
+        sigma (tuple): Tuple of 6 1D sigma arrays for PML:
+            (sigma_E_x, sigma_E_y, sigma_E_z, sigma_H_x, sigma_H_y, sigma_H_z)
         simulate_boundaries (bool): Whether to simulate boundaries.
         periodic_axes (tuple[bool, bool, bool], optional): Tuple of booleans indicating which axes use periodic
             boundaries (periodic_x, periodic_y, periodic_z). Defaults to (False, False, False).
@@ -280,6 +299,25 @@ def curl_H(
     psi_Ezx = psi_E[4, :, :, :]
     psi_Ezy = psi_E[5, :, :, :]
 
+    # Reshape 1D arrays for broadcasting:
+    # - x-component arrays: (nx,) -> (nx, 1, 1)
+    # - y-component arrays: (ny,) -> (1, ny, 1)
+    # - z-component arrays: (nz,) -> (1, 1, nz)
+    alpha_E_x = alpha[0][:, None, None]
+    alpha_E_y = alpha[1][None, :, None]
+    alpha_E_z = alpha[2][None, None, :]
+    kappa_E_x = kappa[0][:, None, None]
+    kappa_E_y = kappa[1][None, :, None]
+    kappa_E_z = kappa[2][None, None, :]
+    sigma_E_x = sigma[0][:, None, None]
+    sigma_E_y = sigma[1][None, :, None]
+    sigma_E_z = sigma[2][None, None, :]
+
+    # Also reshape kappa for H-field (used in curl calculation)
+    kappa_H_x = kappa[3][:, None, None]
+    kappa_H_y = kappa[4][None, :, None]
+    kappa_H_z = kappa[5][None, None, :]
+
     if simulate_boundaries:
         # Get E-field PML coefficients
         b_x = (
@@ -288,7 +326,7 @@ def curl_H(
                 * config.resolution
                 / c0
                 / eps0
-                * (sigma[0, :, :, :] / kappa[0, :, :, :] + alpha[0, :, :, :])
+                * (sigma_E_x / kappa_E_x + alpha_E_x)
             )
             + 1
         )
@@ -298,7 +336,7 @@ def curl_H(
                 * config.resolution
                 / c0
                 / eps0
-                * (sigma[1, :, :, :] / kappa[1, :, :, :] + alpha[1, :, :, :])
+                * (sigma_E_y / kappa_E_y + alpha_E_y)
             )
             + 1
         )
@@ -308,28 +346,28 @@ def curl_H(
                 * config.resolution
                 / c0
                 / eps0
-                * (sigma[2, :, :, :] / kappa[2, :, :, :] + alpha[2, :, :, :])
+                * (sigma_E_z / kappa_E_z + alpha_E_z)
             )
             + 1
         )
 
         a_x = (
             (b_x - 1.0)
-            * sigma[0, :, :, :]
-            / (sigma[0, :, :, :] + alpha[0, :, :, :] * kappa[0, :, :, :])
-            / kappa[0, :, :, :]
+            * sigma_E_x
+            / (sigma_E_x + alpha_E_x * kappa_E_x)
+            / kappa_E_x
         )
         a_y = (
             (b_y - 1.0)
-            * sigma[1, :, :, :]
-            / (sigma[1, :, :, :] + alpha[1, :, :, :] * kappa[1, :, :, :])
-            / kappa[1, :, :, :]
+            * sigma_E_y
+            / (sigma_E_y + alpha_E_y * kappa_E_y)
+            / kappa_E_y
         )
         a_z = (
             (b_z - 1.0)
-            * sigma[2, :, :, :]
-            / (sigma[2, :, :, :] + alpha[2, :, :, :] * kappa[2, :, :, :])
-            / kappa[2, :, :, :]
+            * sigma_E_z
+            / (sigma_E_z + alpha_E_z * kappa_E_z)
+            / kappa_E_z
         )
 
         a_x = jnp.nan_to_num(a_x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -346,9 +384,9 @@ def curl_H(
 
     psi_E_updated = jnp.stack((psi_Exy, psi_Exz, psi_Eyz, psi_Eyx, psi_Ezx, psi_Ezy), axis=0)
 
-    curl_x = (1.0 / kappa[1, :, :, :] * dyHz + psi_Exy) - (1.0 / kappa[2, :, :, :] * dzHy + psi_Exz)
-    curl_y = (1.0 / kappa[2, :, :, :] * dzHx + psi_Eyz) - (1.0 / kappa[0, :, :, :] * dxHz + psi_Eyx)
-    curl_z = (1.0 / kappa[0, :, :, :] * dxHy + psi_Ezx) - (1.0 / kappa[1, :, :, :] * dyHx + psi_Ezy)
+    curl_x = (1.0 / kappa_H_y * dyHz + psi_Exy) - (1.0 / kappa_H_z * dzHy + psi_Exz)
+    curl_y = (1.0 / kappa_H_z * dzHx + psi_Eyz) - (1.0 / kappa_H_x * dxHz + psi_Eyx)
+    curl_z = (1.0 / kappa_H_x * dxHy + psi_Ezx) - (1.0 / kappa_H_y * dyHx + psi_Ezy)
     curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
 
     return curl, psi_E_updated

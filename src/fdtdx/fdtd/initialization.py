@@ -250,27 +250,35 @@ def _init_arrays(
         backend=config.backend,
     )
 
-    # create alpha, kappa, and sigma arrays
-    alpha = create_named_sharded_matrix(
-        (6, *volume_shape),
-        sharding_axis=1,
-        value=0.0,
-        dtype=config.dtype,
-        backend=config.backend,
+    # create alpha, kappa, and sigma arrays as 1D arrays
+    # Each component varies only along its respective axis:
+    # - Components 0, 3 (E_x, H_x): vary along x-axis, shape (nx,), sharded
+    # - Components 1, 4 (E_y, H_y): vary along y-axis, shape (ny,), replicated
+    # - Components 2, 5 (E_z, H_z): vary along z-axis, shape (nz,), replicated
+    nx, ny, nz = volume_shape
+    alpha = (
+        create_named_sharded_matrix((nx,), sharding_axis=0, value=0.0, dtype=config.dtype, backend=config.backend),
+        jnp.zeros((ny,), dtype=config.dtype),
+        jnp.zeros((nz,), dtype=config.dtype),
+        create_named_sharded_matrix((nx,), sharding_axis=0, value=0.0, dtype=config.dtype, backend=config.backend),
+        jnp.zeros((ny,), dtype=config.dtype),
+        jnp.zeros((nz,), dtype=config.dtype),
     )
-    kappa = create_named_sharded_matrix(
-        (6, *volume_shape),
-        sharding_axis=1,
-        value=1.0,
-        dtype=config.dtype,
-        backend=config.backend,
+    kappa = (
+        create_named_sharded_matrix((nx,), sharding_axis=0, value=1.0, dtype=config.dtype, backend=config.backend),
+        jnp.ones((ny,), dtype=config.dtype),
+        jnp.ones((nz,), dtype=config.dtype),
+        create_named_sharded_matrix((nx,), sharding_axis=0, value=1.0, dtype=config.dtype, backend=config.backend),
+        jnp.ones((ny,), dtype=config.dtype),
+        jnp.ones((nz,), dtype=config.dtype),
     )
-    sigma = create_named_sharded_matrix(
-        (6, *volume_shape),
-        sharding_axis=1,
-        value=0.0,
-        dtype=config.dtype,
-        backend=config.backend,
+    sigma = (
+        create_named_sharded_matrix((nx,), sharding_axis=0, value=0.0, dtype=config.dtype, backend=config.backend),
+        jnp.zeros((ny,), dtype=config.dtype),
+        jnp.zeros((nz,), dtype=config.dtype),
+        create_named_sharded_matrix((nx,), sharding_axis=0, value=0.0, dtype=config.dtype, backend=config.backend),
+        jnp.zeros((ny,), dtype=config.dtype),
+        jnp.zeros((nz,), dtype=config.dtype),
     )
 
     # Determine isotropy flags and component counts for each property
