@@ -243,6 +243,15 @@ class ArrayContainer(TreeClass):
     This class holds the electromagnetic field arrays and various state information
     needed during FDTD simulation. It includes the E and H fields, material properties,
     and states for boundaries, detectors and recordings.
+
+    PML coefficients (alpha, kappa, sigma) are stored as tuples of 6 pre-shaped 1D
+    arrays for memory efficiency. Each component i corresponds to axis (i % 3) and is
+    shaped for broadcasting: (Nx,1,1) for x-axis, (1,Ny,1) for y, (1,1,Nz) for z.
+    Components 0-2 are E-field PML, components 3-5 are H-field PML.
+
+    PML auxiliary fields (psi_E, psi_H) are stored sparsely as tuples of 6 (min, max)
+    pairs, where each pair contains arrays covering only the PML boundary slabs on the
+    min and max sides of the corresponding axis.
     """
 
     #: Electric field array.
@@ -251,20 +260,20 @@ class ArrayContainer(TreeClass):
     #: Magnetic field array.
     H: jax.Array
 
-    #: Auxiliary electric field array.
-    psi_E: jax.Array
+    #: Sparse auxiliary E-field arrays for PML. Tuple of 6 (min_slab, max_slab) pairs.
+    psi_E: tuple[tuple[jax.Array, jax.Array], ...]
 
-    #: Auxiliary magnetic field array.
-    psi_H: jax.Array
+    #: Sparse auxiliary H-field arrays for PML. Tuple of 6 (min_slab, max_slab) pairs.
+    psi_H: tuple[tuple[jax.Array, jax.Array], ...]
 
-    #: Alpha array for PML calculations.
-    alpha: jax.Array
+    #: 1D alpha profiles for PML. Tuple of 6 arrays shaped for 3D broadcasting.
+    alpha: tuple[jax.Array, ...]
 
-    #: Kappa array for PML calculations.
-    kappa: jax.Array
+    #: 1D kappa profiles for PML. Tuple of 6 arrays shaped for 3D broadcasting.
+    kappa: tuple[jax.Array, ...]
 
-    #: Sigma array for PML calculations.
-    sigma: jax.Array
+    #: 1D sigma profiles for PML. Tuple of 6 arrays shaped for 3D broadcasting.
+    sigma: tuple[jax.Array, ...]
 
     #: Inverse permittivity values array.
     inv_permittivities: jax.Array
@@ -313,6 +322,11 @@ def reset_array_container(
     arrays = arrays.aset("E", E)
     H = arrays.H * 0
     arrays = arrays.aset("H", H)
+
+    psi_E = tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_E)
+    arrays = arrays.aset("psi_E", psi_E)
+    psi_H = tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_H)
+    arrays = arrays.aset("psi_H", psi_H)
 
     detector_states = arrays.detector_states
     if reset_detector_states:

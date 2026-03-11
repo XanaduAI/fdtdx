@@ -32,6 +32,8 @@ def place_objects(
     config: SimulationConfig,
     constraints: Sequence[(PositionConstraint | SizeConstraint | SizeExtensionConstraint | GridCoordinateConstraint)],
     key: jax.Array,
+    precomputed_inv_permittivities: jax.Array | None = None,
+    precomputed_electric_conductivity: jax.Array | None = None,
 ) -> tuple[
     ObjectContainer,
     ArrayContainer,
@@ -46,6 +48,12 @@ def place_objects(
         config (SimulationConfig): Simulation configuration.
         constraints (Sequence[Constraint]): List of positioning/sizing constraints referencing object names.
         key (jax.Array): JAX random key for initialization.
+        precomputed_inv_permittivities: If provided, used directly instead of allocating and
+            computing inverse permittivities from object materials.  Skips the
+            permittivity branch of the static-material initialisation loop.
+        precomputed_electric_conductivity: If provided, used directly instead of allocating and
+            computing electric conductivity from object materials.  Skips the
+            electric-conductivity branch of the static-material initialisation loop.
 
     Returns:
         tuple[ObjectContainer, ArrayContainer, ParameterContainer, SimulationConfig, dict[str, Any]]:
@@ -112,7 +120,12 @@ def place_objects(
 
     # Step 7: Initialize parameters and arrays
     params = _init_params(objects=objects_container, key=key)
-    arrays, config, info = _init_arrays(objects=objects_container, config=config)
+    arrays, config, info = _init_arrays(
+        objects=objects_container,
+        config=config,
+        precomputed_inv_permittivities=precomputed_inv_permittivities,
+        precomputed_electric_conductivity=precomputed_electric_conductivity,
+    )
 
     # Step 8: Update object configs with compiled configuration
     new_object_list = []
@@ -209,6 +222,8 @@ def apply_params(
 def _init_arrays(
     objects: ObjectContainer,
     config: SimulationConfig,
+    precomputed_inv_permittivities: jax.Array | None = None,
+    precomputed_electric_conductivity: jax.Array | None = None,
 ) -> tuple[ArrayContainer, SimulationConfig, dict[str, Any]]:
     """Initializes field arrays and material properties for the simulation.
 
@@ -219,6 +234,10 @@ def _init_arrays(
     Args:
         objects (ObjectContainer): Container with simulation objects
         config (SimulationConfig): The simulation configuration
+        precomputed_inv_permittivities: If provided, used directly instead of
+            allocating zeros and filling from object materials.
+        precomputed_electric_conductivity: If provided, used directly instead of
+            allocating zeros and filling from object materials.
 
     Returns:
         tuple[ArrayContainer, SimulationConfig, dict[str, Any]]: A tuple containing:
@@ -244,44 +263,53 @@ def _init_arrays(
         backend=config.backend,
     )
 
-    # create auxiliary fields psi_E and psi_H for PML boundaries
-    psi_E = create_named_sharded_matrix(
-        (6, *volume_shape),
-        sharding_axis=1,
-        value=0.0,
-        dtype=config.dtype,
-        backend=config.backend,
-    )
-    psi_H = create_named_sharded_matrix(
-        (6, *volume_shape),
-        value=0.0,
-        dtype=config.dtype,
-        sharding_axis=1,
-        backend=config.backend,
-    )
+    # Determine PML thicknesses per axis from boundary objects
+    Nx, Ny, Nz = volume_shape
+    axis_lengths = (Nx, Ny, Nz)
+    pml_thicknesses = [[0, 0], [0, 0], [0, 0]]  # [min, max] per axis
+    from fdtdx.objects.boundaries.perfectly_matched_layer import PerfectlyMatchedLayer as _PML
+    for boundary in objects.pml_objects:
+        if isinstance(boundary, _PML):
+            axis = boundary.axis
+            L = boundary.thickness
+            if boundary.direction == "-":
+                pml_thicknesses[axis][0] = L
+            else:
+                pml_thicknesses[axis][1] = L
 
-    # create alpha, kappa, and sigma arrays
-    alpha = create_named_sharded_matrix(
-        (6, *volume_shape),
-        sharding_axis=1,
-        value=0.0,
-        dtype=config.dtype,
-        backend=config.backend,
-    )
-    kappa = create_named_sharded_matrix(
-        (6, *volume_shape),
-        sharding_axis=1,
-        value=1.0,
-        dtype=config.dtype,
-        backend=config.backend,
-    )
-    sigma = create_named_sharded_matrix(
-        (6, *volume_shape),
-        sharding_axis=1,
-        value=0.0,
-        dtype=config.dtype,
-        backend=config.backend,
-    )
+    # Create 1D alpha/kappa/sigma arrays shaped for 3D broadcasting
+    alpha_list: list[jax.Array] = []
+    kappa_list: list[jax.Array] = []
+    sigma_list: list[jax.Array] = []
+    for i in range(6):
+        axis = i % 3
+        shape = [1, 1, 1]
+        shape[axis] = axis_lengths[axis]
+        alpha_list.append(jnp.zeros(shape, dtype=config.dtype))
+        kappa_list.append(jnp.ones(shape, dtype=config.dtype))
+        sigma_list.append(jnp.zeros(shape, dtype=config.dtype))
+
+    # Create sparse psi_E and psi_H (only PML boundary slabs)
+    # Psi component axis mapping: [xy,xz,yz,yx,zx,zy] -> PML axes [1,2,2,0,0,1]
+    from fdtdx.core.physics.curl import PSI_COMPONENT_AXIS
+
+    def _make_sparse_psi() -> tuple[tuple[jax.Array, jax.Array], ...]:
+        components = []
+        for i in range(6):
+            axis = PSI_COMPONENT_AXIS[i]
+            L_min, L_max = pml_thicknesses[axis]
+            min_shape = list(volume_shape)
+            min_shape[axis] = L_min
+            max_shape = list(volume_shape)
+            max_shape[axis] = L_max
+            components.append((
+                jnp.zeros(min_shape, dtype=config.dtype),
+                jnp.zeros(max_shape, dtype=config.dtype),
+            ))
+        return tuple(components)
+
+    psi_E = _make_sparse_psi()
+    psi_H = _make_sparse_psi()
 
     # Determine isotropy flags
     isotropic_permittivity = objects.all_objects_isotropic_permittivity
@@ -325,13 +353,16 @@ def _init_arrays(
         num_magnetic_cond_components = 9
 
     # permittivity - shape (1, Nx, Ny, Nz) for isotropic, (3, Nx, Ny, Nz) for diagonally anisotropic, (9, Nx, Ny, Nz) for fully anisotropic
-    inv_permittivities = create_named_sharded_matrix(
-        (num_perm_components, *volume_shape),
-        value=0.0,
-        dtype=config.dtype,
-        sharding_axis=1,
-        backend=config.backend,
-    )
+    if precomputed_inv_permittivities is not None:
+        inv_permittivities = precomputed_inv_permittivities
+    else:
+        inv_permittivities = create_named_sharded_matrix(
+            (num_perm_components, *volume_shape),
+            value=0.0,
+            dtype=config.dtype,
+            sharding_axis=1,
+            backend=config.backend,
+        )
 
     # permeability - scalar 1.0 if non-magnetic, else (1, Nx, Ny, Nz) for isotropic, (3, Nx, Ny, Nz) for diagonally anisotropic, (9, Nx, Ny, Nz) for fully anisotropic
     if objects.all_objects_non_magnetic:
@@ -346,8 +377,10 @@ def _init_arrays(
         )
 
     # electric conductivity - None if non-conductive, else (1, Nx, Ny, Nz) for isotropic, (3, Nx, Ny, Nz) for diagonally anisotropic, (9, Nx, Ny, Nz) for fully anisotropic
-    electric_conductivity = None
-    if not objects.all_objects_non_electrically_conductive:
+    electric_conductivity: jax.Array | None
+    if precomputed_electric_conductivity is not None:
+        electric_conductivity = precomputed_electric_conductivity
+    elif not objects.all_objects_non_electrically_conductive:
         electric_conductivity = create_named_sharded_matrix(
             (num_electric_cond_components, *volume_shape),
             value=0.0,
@@ -355,6 +388,8 @@ def _init_arrays(
             sharding_axis=1,
             backend=config.backend,
         )
+    else:
+        electric_conductivity = None
 
     # magnetic conductivity - None if non-conductive, else (1, Nx, Ny, Nz) for isotropic, (3, Nx, Ny, Nz) for diagonally anisotropic, (9, Nx, Ny, Nz) for fully anisotropic
     magnetic_conductivity = None
@@ -378,23 +413,24 @@ def _init_arrays(
             # Material properties are tuples (εxx, εxy, εxz, εyx, εyy, εyz, εzx, εzy, εzz)
             # Arrays have shape (num_components, Nx, Ny, Nz) where num_components is 1 (isotropic), 3 (diagonally anisotropic), or 9 (fully anisotropic)
 
-            if num_perm_components == 1:
-                # Isotropic: simple element-wise inversion
-                perm_tuple = (o.material.permittivity[0],)
-                inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
-                inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
-            elif num_perm_components == 3:
-                # Diagonally anisotropic: simple element-wise inversion
-                perm_tuple = (o.material.permittivity[0], o.material.permittivity[4], o.material.permittivity[8])
-                inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
-                inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
-            else:
-                # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
-                perm_tuple = o.material.permittivity
-                perm_matrix = jnp.array(perm_tuple, dtype=config.dtype).reshape(3, 3)
-                inv_perm_matrix = jnp.linalg.inv(perm_matrix)
-                inv_obj_permittivity = inv_perm_matrix.flatten()[:, None, None, None]
-                inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
+            if precomputed_inv_permittivities is None:
+                if num_perm_components == 1:
+                    # Isotropic: simple element-wise inversion
+                    perm_tuple = (o.material.permittivity[0],)
+                    inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
+                elif num_perm_components == 3:
+                    # Diagonally anisotropic: simple element-wise inversion
+                    perm_tuple = (o.material.permittivity[0], o.material.permittivity[4], o.material.permittivity[8])
+                    inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
+                else:
+                    # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
+                    perm_tuple = o.material.permittivity
+                    perm_matrix = jnp.array(perm_tuple, dtype=config.dtype).reshape(3, 3)
+                    inv_perm_matrix = jnp.linalg.inv(perm_matrix)
+                    inv_obj_permittivity = inv_perm_matrix.flatten()[:, None, None, None]
+                    inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
 
             if isinstance(inv_permeabilities, jax.Array) and inv_permeabilities.ndim > 0:
                 if num_permeability_components == 1:
@@ -415,7 +451,7 @@ def _init_arrays(
                     inv_obj_permeability = inv_perm_matrix.flatten()[:, None, None, None]
                     inv_permeabilities = inv_permeabilities.at[:, *o.grid_slice].set(inv_obj_permeability)
 
-            if electric_conductivity is not None:
+            if precomputed_electric_conductivity is None and electric_conductivity is not None:
                 if num_electric_cond_components == 1:
                     # Isotropic
                     cond_tuple = (o.material.electric_conductivity[0],)
@@ -461,25 +497,26 @@ def _init_arrays(
             indices = o.get_material_mapping()
             mask = o.get_voxel_mask_for_shape()
 
-            # compute_allowed_permittivities returns list of tuples with length 1 (isotropic), 3 (diagonally anisotropic), or 9 (fully anisotropic)
-            allowed_perms = jnp.asarray(
-                compute_allowed_permittivities(
-                    o.materials,
-                    isotropic=isotropic_permittivity,
-                    diagonally_anisotropic=diagonally_anisotropic_permittivity,
+            if precomputed_inv_permittivities is None:
+                # compute_allowed_permittivities returns list of tuples with length 1 (isotropic), 3 (diagonally anisotropic), or 9 (fully anisotropic)
+                allowed_perms = jnp.asarray(
+                    compute_allowed_permittivities(
+                        o.materials,
+                        isotropic=isotropic_permittivity,
+                        diagonally_anisotropic=diagonally_anisotropic_permittivity,
+                    )
                 )
-            )
-            if num_perm_components == 1 or num_perm_components == 3:
-                allowed_inv_perms = 1 / allowed_perms  # shape: (num_materials, num_components)
-            else:
-                # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
-                allowed_inv_perms = jnp.array([jnp.linalg.inv(perm.reshape(3, 3)).flatten() for perm in allowed_perms])
+                if num_perm_components == 1 or num_perm_components == 3:
+                    allowed_inv_perms = 1 / allowed_perms  # shape: (num_materials, num_components)
+                else:
+                    # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
+                    allowed_inv_perms = jnp.array([jnp.linalg.inv(perm.reshape(3, 3)).flatten() for perm in allowed_perms])
 
-            # allowed_inv_perms[indices] -> (*grid_shape, num_components)
-            # After moveaxis -> (num_components, *grid_shape)
-            component_values = jnp.moveaxis(allowed_inv_perms[indices], -1, 0)
-            diff = component_values - inv_permittivities[:, *o.grid_slice]
-            inv_permittivities = inv_permittivities.at[:, *o.grid_slice].add(mask * diff)
+                # allowed_inv_perms[indices] -> (*grid_shape, num_components)
+                # After moveaxis -> (num_components, *grid_shape)
+                component_values = jnp.moveaxis(allowed_inv_perms[indices], -1, 0)
+                diff = component_values - inv_permittivities[:, *o.grid_slice]
+                inv_permittivities = inv_permittivities.at[:, *o.grid_slice].add(mask * diff)
 
             if isinstance(inv_permeabilities, jax.Array) and inv_permeabilities.ndim > 0:
                 allowed_perms = jnp.asarray(
@@ -501,7 +538,7 @@ def _init_arrays(
                 diff = component_values - inv_permeabilities[:, *o.grid_slice]
                 inv_permeabilities = inv_permeabilities.at[:, *o.grid_slice].add(mask * diff)
 
-            if electric_conductivity is not None:
+            if precomputed_electric_conductivity is None and electric_conductivity is not None:
                 allowed_conds = jnp.asarray(
                     compute_allowed_electric_conductivities(
                         o.materials,
@@ -534,23 +571,27 @@ def _init_arrays(
     for d in objects.detectors:
         detector_states[d.name] = d.init_state()
 
-    # modify arrays for boundaries
+    # modify arrays for boundaries (PML writes 1D profiles into alpha/kappa/sigma lists)
     for boundary in objects.boundary_objects:
         if hasattr(boundary, "modify_arrays") and callable(getattr(boundary, "modify_arrays", None)):
             modify_fn = getattr(boundary, "modify_arrays")
             result = modify_fn(
-                alpha=alpha,
-                kappa=kappa,
-                sigma=sigma,
+                alpha=alpha_list,
+                kappa=kappa_list,
+                sigma=sigma_list,
                 electric_conductivity=electric_conductivity,
                 magnetic_conductivity=magnetic_conductivity,
             )
             if result is not None:
-                alpha = result.get("alpha", alpha)
-                kappa = result.get("kappa", kappa)
-                sigma = result.get("sigma", sigma)
+                alpha_list = result.get("alpha", alpha_list)
+                kappa_list = result.get("kappa", kappa_list)
+                sigma_list = result.get("sigma", sigma_list)
                 electric_conductivity = result.get("electric_conductivity", electric_conductivity)
                 magnetic_conductivity = result.get("magnetic_conductivity", magnetic_conductivity)
+
+    alpha = tuple(alpha_list)
+    kappa = tuple(kappa_list)
+    sigma = tuple(sigma_list)
 
     # interfaces
     recording_state = None

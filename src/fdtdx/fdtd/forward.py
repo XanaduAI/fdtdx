@@ -11,11 +11,11 @@ def forward_single_args_wrapper(
     time_step: jax.Array,
     E: jax.Array,
     H: jax.Array,
-    psi_E: jax.Array,
-    psi_H: jax.Array,
-    alpha: jax.Array,
-    kappa: jax.Array,
-    sigma: jax.Array,
+    psi_E: tuple[tuple[jax.Array, jax.Array], ...],
+    psi_H: tuple[tuple[jax.Array, jax.Array], ...],
+    alpha: tuple[jax.Array, ...],
+    kappa: tuple[jax.Array, ...],
+    sigma: tuple[jax.Array, ...],
     inv_permittivities: jax.Array,
     inv_permeabilities: jax.Array,
     detector_states: dict[str, DetectorState],
@@ -26,20 +26,7 @@ def forward_single_args_wrapper(
     record_detectors: bool,
     record_boundaries: bool,
     simulate_boundaries: bool,
-) -> tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array | float,
-    dict[str, DetectorState],
-    RecordingState | None,
-]:
+):
     # Wrapper function that unpacks ArrayContainer into individual arrays for JAX transformations.
     arr = ArrayContainer(
         E=E,

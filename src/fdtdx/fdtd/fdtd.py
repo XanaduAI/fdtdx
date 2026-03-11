@@ -85,11 +85,11 @@ def reversible_fdtd(
     def reversible_fdtd_primal(
         E: jax.Array,
         H: jax.Array,
-        psi_E: jax.Array,
-        psi_H: jax.Array,
-        alpha: jax.Array,
-        kappa: jax.Array,
-        sigma: jax.Array,
+        psi_E: tuple[tuple[jax.Array, jax.Array], ...],
+        psi_H: tuple[tuple[jax.Array, jax.Array], ...],
+        alpha: tuple[jax.Array, ...],
+        kappa: tuple[jax.Array, ...],
+        sigma: tuple[jax.Array, ...],
         inv_permittivities: jax.Array,
         inv_permeabilities: jax.Array,
         detector_states: dict[str, DetectorState],
@@ -232,11 +232,11 @@ def reversible_fdtd(
     def fdtd_fwd(
         E: jax.Array,
         H: jax.Array,
-        psi_E: jax.Array,
-        psi_H: jax.Array,
-        alpha: jax.Array,
-        kappa: jax.Array,
-        sigma: jax.Array,
+        psi_E: tuple[tuple[jax.Array, jax.Array], ...],
+        psi_H: tuple[tuple[jax.Array, jax.Array], ...],
+        alpha: tuple[jax.Array, ...],
+        kappa: tuple[jax.Array, ...],
+        sigma: tuple[jax.Array, ...],
         inv_permittivities: jax.Array,
         inv_permeabilities: jax.Array,
         detector_states: dict[str, DetectorState],
@@ -335,6 +335,7 @@ def reversible_fdtd(
     return time_step, out_arrs
 
 
+@jax.jit(donate_argnames=("arrays",))
 def checkpointed_fdtd(
     arrays: ArrayContainer,
     objects: ObjectContainer,

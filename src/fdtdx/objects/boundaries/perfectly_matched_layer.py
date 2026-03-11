@@ -115,14 +115,14 @@ class PerfectlyMatchedLayer(BaseBoundary):
         """
         return self.grid_shape[self.axis]
 
-    def _compute_pml_profile(
+    def _compute_pml_profile_1d(
         self,
         value_start: float,
         value_end: float,
         order: float,
         dtype,
     ) -> tuple[jax.Array, jax.Array]:
-        """Computes a graded PML profile using polynomial scaling.
+        """Computes a graded 1D PML profile using polynomial scaling.
 
         Args:
             value_start: Value at the interface (inner boundary)
@@ -131,57 +131,42 @@ class PerfectlyMatchedLayer(BaseBoundary):
             dtype: Data type for the array
 
         Returns:
-            jax.Array: Graded profile array with shape self.grid_shape
+            tuple[jax.Array, jax.Array]: 1D E-field and H-field profiles of shape (L,)
         """
-        L = self.thickness  # Total thickness of PML
+        L = self.thickness
 
-        # Create distance array along the PML axis
-        # d varies from 0 (at interface) to L (at outer edge)
         if self.direction == "-":
-            # For min boundary, distance increases as we go towards lower indices
             dE = jnp.arange(L - 1, -1, -1, dtype=dtype)
             dH = jnp.append(jnp.arange(L - 1.5, -0.5, -1, dtype=dtype), 0)
         else:
-            # For max boundary, distance increases as we go towards higher indices
             dE = jnp.insert(jnp.arange(0.5, L - 0.5, 1, dtype=dtype), 0, 0)
             dH = jnp.arange(0, L, 1, dtype=dtype)
 
-        # Compute polynomial grading: value_start + (value_end - value_start) * (d/L)^order
         profileE_1d = value_start + (value_end - value_start) * jnp.power(dE / L, order)
         profileH_1d = value_start + (value_end - value_start) * jnp.power(dH / L, order)
 
-        # Create shape matching PML region with grading only along self.axis
-        shape = [1, 1, 1]
-        shape[self.axis] = L
-        profileE_reshaped = profileE_1d.reshape(shape)
-        profileH_reshaped = profileH_1d.reshape(shape)
-        # Broadcast to full grid_shape
-        profileE = jnp.broadcast_to(profileE_reshaped, self.grid_shape)
-        profileH = jnp.broadcast_to(profileH_reshaped, self.grid_shape)
-
-        return profileE, profileH
+        return profileE_1d, profileH_1d
 
     def modify_arrays(
         self,
-        alpha: jax.Array,
-        kappa: jax.Array,
-        sigma: jax.Array,
+        alpha: list[jax.Array],
+        kappa: list[jax.Array],
+        sigma: list[jax.Array],
         electric_conductivity,
         magnetic_conductivity,
-    ) -> dict[str, jax.Array]:
-        """Modifies simulation arrays to include PML parameters.
+    ) -> dict[str, list[jax.Array]]:
+        """Modifies 1D PML coefficient arrays to include this boundary's profiles.
 
         Args:
-            alpha: Alpha array for PML calculations (shape: ``(3, *volume_shape)``)
-            kappa: Kappa array for PML calculations (shape: ``(3, *volume_shape)``)
-            sigma: Sigma array for PML calculations (shape: ``(3, *volume_shape)``)
-            electric_conductivity: Electric conductivity array (shape: volume_shape)
-            magnetic_conductivity: Magnetic conductivity array (shape: volume_shape)
+            alpha: List of 6 arrays shaped for 3D broadcasting along their axis.
+            kappa: List of 6 arrays shaped for 3D broadcasting along their axis.
+            sigma: List of 6 arrays shaped for 3D broadcasting along their axis.
+            electric_conductivity: Electric conductivity array (unchanged).
+            magnetic_conductivity: Magnetic conductivity array (unchanged).
 
         Returns:
-            dict: Dictionary with modified 'alpha', 'kappa', and 'sigma' arrays
+            dict: Dictionary with modified 'alpha', 'kappa', 'sigma' lists.
         """
-
         assert self.alpha_start is not None, "alpha_start should be set by __post_init__"
         assert self.alpha_end is not None, "alpha_end   should be set by __post_init__"
         assert self.alpha_order is not None, "alpha_order should be set by __post_init__"
@@ -194,36 +179,37 @@ class PerfectlyMatchedLayer(BaseBoundary):
 
         dtype = self._config.dtype
 
-        # Compute PML parameters using polynomial grading
-        sigma_E, sigma_H = self._compute_pml_profile(
-            value_start=self.sigma_start,
-            value_end=self.sigma_end,
-            order=self.sigma_order,
-            dtype=dtype,
+        sigma_E_1d, sigma_H_1d = self._compute_pml_profile_1d(
+            value_start=self.sigma_start, value_end=self.sigma_end,
+            order=self.sigma_order, dtype=dtype,
+        )
+        kappa_E_1d, kappa_H_1d = self._compute_pml_profile_1d(
+            value_start=self.kappa_start, value_end=self.kappa_end,
+            order=self.kappa_order, dtype=dtype,
+        )
+        alpha_E_1d, alpha_H_1d = self._compute_pml_profile_1d(
+            value_start=self.alpha_start, value_end=self.alpha_end,
+            order=self.alpha_order, dtype=dtype,
         )
 
-        kappa_E, kappa_H = self._compute_pml_profile(
-            value_start=self.kappa_start,
-            value_end=self.kappa_end,
-            order=self.kappa_order,
-            dtype=dtype,
-        )
+        axis_slice = self.grid_slice[self.axis]
+        e_idx = self.axis
+        h_idx = self.axis + 3
 
-        alpha_E, alpha_H = self._compute_pml_profile(
-            value_start=self.alpha_start,
-            value_end=self.alpha_end,
-            order=self.alpha_order,
-            dtype=dtype,
-        )
+        # Build indexing tuple for the 3D-broadcastable array (e.g. shape (Nx,1,1))
+        idx = [slice(None)] * 3
+        idx[self.axis] = axis_slice
 
-        # Update arrays in the PML region
-        # The PML parameters vary along self.axis, so we need to broadcast them correctly
-        alpha = alpha.at[self.axis, *self.grid_slice].set(alpha_E)
-        kappa = kappa.at[self.axis, *self.grid_slice].set(kappa_E)
-        sigma = sigma.at[self.axis, *self.grid_slice].set(sigma_E)
-        alpha = alpha.at[self.axis + 3, *self.grid_slice].set(alpha_H)
-        kappa = kappa.at[self.axis + 3, *self.grid_slice].set(kappa_H)
-        sigma = sigma.at[self.axis + 3, *self.grid_slice].set(sigma_H)
+        # Reshape 1D profiles to match the broadcastable shape
+        shape = [1, 1, 1]
+        shape[self.axis] = -1
+
+        alpha[e_idx] = alpha[e_idx].at[tuple(idx)].set(alpha_E_1d.reshape(shape))
+        kappa[e_idx] = kappa[e_idx].at[tuple(idx)].set(kappa_E_1d.reshape(shape))
+        sigma[e_idx] = sigma[e_idx].at[tuple(idx)].set(sigma_E_1d.reshape(shape))
+        alpha[h_idx] = alpha[h_idx].at[tuple(idx)].set(alpha_H_1d.reshape(shape))
+        kappa[h_idx] = kappa[h_idx].at[tuple(idx)].set(kappa_H_1d.reshape(shape))
+        sigma[h_idx] = sigma[h_idx].at[tuple(idx)].set(sigma_H_1d.reshape(shape))
 
         return {
             "alpha": alpha,
