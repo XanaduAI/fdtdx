@@ -394,6 +394,7 @@ def checkpointed_fdtd(
     return state
 
 
+@jax.jit(donate_argnames=("arrays",))
 def custom_fdtd_forward(
     arrays: ArrayContainer,
     objects: ObjectContainer,
