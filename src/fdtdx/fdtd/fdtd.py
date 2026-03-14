@@ -400,8 +400,8 @@ def custom_fdtd_forward(
     objects: ObjectContainer,
     config: SimulationConfig,
     key: jax.Array,
-    reset_container: bool,
-    record_detectors: bool,
+    #reset_container: bool,
+    #record_detectors: bool,
     start_time: int | jax.Array,
     end_time: int | jax.Array,
 ) -> SimulationState:
@@ -427,8 +427,8 @@ def custom_fdtd_forward(
         This function is useful for implementing custom simulation strategies or
         running partial simulations for analysis purposes.
     """
-    if reset_container:
-        arrays = reset_array_container(arrays, objects)
+    #if reset_container:
+    #    arrays = reset_array_container(arrays, objects)
     state = (jnp.asarray(start_time, dtype=jnp.int32), arrays)
     state = eqxi.while_loop(
         max_steps=config.time_steps_total,
@@ -438,8 +438,8 @@ def custom_fdtd_forward(
             config=config,
             objects=objects,
             key=key,
-            record_detectors=record_detectors,
-            record_boundaries=False,
+            record_detectors=True,
+            record_boundaries=config.invertible_optimization,
             simulate_boundaries=True,
         ),
         init_val=state,
