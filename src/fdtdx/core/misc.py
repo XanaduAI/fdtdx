@@ -552,6 +552,8 @@ def pad_fields(
     Returns:
         jax.Array: Padded fields (3, Nx, Ny, Nz) for each field component
     """
+
+    """
     padded_fields = fields
 
     for i, periodic in enumerate(periodic_axes):
@@ -564,5 +566,6 @@ def pad_fields(
         else:  # i == 2
             pad_width = ((0, 0), (0, 0), (0, 0), (1, 1))
         padded_fields = jnp.pad(padded_fields, pad_width, mode=pad_mode)
-
-    return padded_fields
+    """
+    pad_width = ((0, 0), (1, 1), (1, 1), (1, 1))
+    return jnp.pad(fields, pad_width, mode="constant")

@@ -151,12 +151,18 @@ def curl_E(
     """
     E_pad = pad_fields(E, periodic_axes)
 
-    dyEz = (jnp.roll(E_pad[2], -1, axis=1) - E_pad[2])[1:-1, 1:-1, 1:-1]
-    dzEy = (jnp.roll(E_pad[1], -1, axis=2) - E_pad[1])[1:-1, 1:-1, 1:-1]
-    dzEx = (jnp.roll(E_pad[0], -1, axis=2) - E_pad[0])[1:-1, 1:-1, 1:-1]
-    dxEz = (jnp.roll(E_pad[2], -1, axis=0) - E_pad[2])[1:-1, 1:-1, 1:-1]
-    dxEy = (jnp.roll(E_pad[1], -1, axis=0) - E_pad[1])[1:-1, 1:-1, 1:-1]
-    dyEx = (jnp.roll(E_pad[0], -1, axis=1) - E_pad[0])[1:-1, 1:-1, 1:-1]
+    #dyEz = (jnp.roll(E_pad[2], -1, axis=1) - E_pad[2])[1:-1, 1:-1, 1:-1]
+    #dzEy = (jnp.roll(E_pad[1], -1, axis=2) - E_pad[1])[1:-1, 1:-1, 1:-1]
+    #dzEx = (jnp.roll(E_pad[0], -1, axis=2) - E_pad[0])[1:-1, 1:-1, 1:-1]
+    #dxEz = (jnp.roll(E_pad[2], -1, axis=0) - E_pad[2])[1:-1, 1:-1, 1:-1]
+    #dxEy = (jnp.roll(E_pad[1], -1, axis=0) - E_pad[1])[1:-1, 1:-1, 1:-1]
+    #dyEx = (jnp.roll(E_pad[0], -1, axis=1) - E_pad[0])[1:-1, 1:-1, 1:-1]
+    dyEz = E_pad[2, 1:-1, 2:, 1:-1] - E_pad[2, 1:-1, 1:-1, 1:-1]
+    dzEy = E_pad[1, 1:-1, 1:-1, 2:] - E_pad[1, 1:-1, 1:-1, 1:-1]
+    dzEx = E_pad[0, 1:-1, 1:-1, 2:] - E_pad[0, 1:-1, 1:-1, 1:-1]
+    dxEz = E_pad[2, 2:, 1:-1, 1:-1] - E_pad[2, 1:-1, 1:-1, 1:-1]
+    dxEy = E_pad[1, 2:, 1:-1, 1:-1] - E_pad[1, 1:-1, 1:-1, 1:-1]
+    dyEx = E_pad[0, 1:-1, 2:, 1:-1] - E_pad[0, 1:-1, 1:-1, 1:-1]
 
     # Derivative fields in the order matching psi components [xy, xz, yz, yx, zx, zy]
     d_fields = (dyEz, dzEy, dzEx, dxEz, dxEy, dyEx)
@@ -220,12 +226,18 @@ def curl_H(
     """
     H_pad = pad_fields(H, periodic_axes)
 
-    dyHz = (H_pad[2] - jnp.roll(H_pad[2], 1, axis=1))[1:-1, 1:-1, 1:-1]
-    dzHy = (H_pad[1] - jnp.roll(H_pad[1], 1, axis=2))[1:-1, 1:-1, 1:-1]
-    dzHx = (H_pad[0] - jnp.roll(H_pad[0], 1, axis=2))[1:-1, 1:-1, 1:-1]
-    dxHz = (H_pad[2] - jnp.roll(H_pad[2], 1, axis=0))[1:-1, 1:-1, 1:-1]
-    dxHy = (H_pad[1] - jnp.roll(H_pad[1], 1, axis=0))[1:-1, 1:-1, 1:-1]
-    dyHx = (H_pad[0] - jnp.roll(H_pad[0], 1, axis=1))[1:-1, 1:-1, 1:-1]
+    #dyHz = (H_pad[2] - jnp.roll(H_pad[2], 1, axis=1))[1:-1, 1:-1, 1:-1]
+    #dzHy = (H_pad[1] - jnp.roll(H_pad[1], 1, axis=2))[1:-1, 1:-1, 1:-1]
+    #dzHx = (H_pad[0] - jnp.roll(H_pad[0], 1, axis=2))[1:-1, 1:-1, 1:-1]
+    #dxHz = (H_pad[2] - jnp.roll(H_pad[2], 1, axis=0))[1:-1, 1:-1, 1:-1]
+    #dxHy = (H_pad[1] - jnp.roll(H_pad[1], 1, axis=0))[1:-1, 1:-1, 1:-1]
+    #dyHx = (H_pad[0] - jnp.roll(H_pad[0], 1, axis=1))[1:-1, 1:-1, 1:-1]
+    dyHz = H_pad[2, 1:-1, :-2, 1:-1] - H_pad[2, 1:-1, 1:-1, 1:-1]
+    dzHy = H_pad[1, 1:-1, 1:-1, :-2] - H_pad[1, 1:-1, 1:-1, 1:-1]
+    dzHx = H_pad[0, 1:-1, 1:-1, :-2] - H_pad[0, 1:-1, 1:-1, 1:-1]
+    dxHz = H_pad[2, :-2, 1:-1, 1:-1] - H_pad[2, 1:-1, 1:-1, 1:-1]
+    dxHy = H_pad[1, :-2, 1:-1, 1:-1] - H_pad[1, 1:-1, 1:-1, 1:-1]
+    dyHx = H_pad[0, 1:-1, :-2, 1:-1] - H_pad[0, 1:-1, 1:-1, 1:-1]
 
     d_fields = (dyHz, dzHy, dzHx, dxHz, dxHy, dyHx)
 
