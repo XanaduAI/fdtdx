@@ -101,12 +101,6 @@ def forward(
         SimulationState: Updated simulation state for the next time step
     """
     time_step, arrays = state
-    jax.lax.cond(
-        time_step % 100 == 0,
-        lambda t: jax.debug.callback(lambda ts: print(f"Step {ts}/{config.time_steps_total}"), t),
-        lambda t: None,
-        time_step,
-    )
     H_prev = arrays.H
     arrays = update_E(
         time_step=time_step,
