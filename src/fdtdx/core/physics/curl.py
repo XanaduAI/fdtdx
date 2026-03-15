@@ -195,8 +195,8 @@ def curl_E(
     curl_z = _scatter_psi_component(curl_z, *psi_H_updated[4], axis=0, sign=+1.0)
     curl_z = _scatter_psi_component(curl_z, *psi_H_updated[5], axis=1, sign=-1.0)
 
-    curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
-    return curl, psi_H_updated
+    #curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
+    return curl_x, curl_y, curl_z, psi_H_updated
 
 
 def curl_H(
@@ -264,5 +264,5 @@ def curl_H(
     curl_z = _scatter_psi_component(curl_z, *psi_E_updated[4], axis=0, sign=+1.0)
     curl_z = _scatter_psi_component(curl_z, *psi_E_updated[5], axis=1, sign=-1.0)
 
-    curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
-    return curl, psi_E_updated
+    #curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
+    return curl_x, curl_y, curl_z, psi_E_updated

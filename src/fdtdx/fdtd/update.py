@@ -63,7 +63,7 @@ def update_E(
     sigma_E = arrays.electric_conductivity
     c = config.courant_number
     periodic_axes = get_periodic_axes(objects)
-    curl, psi_E = curl_H(
+    curl_x, curl_y, curl_z, psi_E = curl_H(
         config,
         arrays.H,
         arrays.psi_E,
@@ -81,22 +81,23 @@ def update_E(
 
     if not inv_eps_is_full_tensor and not sigma_E_is_full_tensor:
         # Isotropic and diagonal anisotropic case
-        factor = 1
         if sigma_E is not None:
             # update formula for lossy material. Simplifies to Noop for conductivity = 0
             # for details see Schneider, chapter 3.12
             # Component-wise multiplication: sigma_E[i, x, y, z] * inv_eps[i, x, y, z]
             factor = 1 - c * sigma_E * eta0 * inv_eps / 2
+            Ex = factor * arrays.E[0] + c * curl_x * inv_eps[0]
+            Ey = factor * arrays.E[1] + c * curl_y * inv_eps[1]
+            Ez = factor * arrays.E[2] + c * curl_z * inv_eps[2]
 
-        # standard update formula using lossless material
-        # Component-wise multiplication for diagonally anisotropic materials:
-        # E[i, x, y, z] = factor * E[i, x, y, z] + c * curl[i, x, y, z] * inv_eps[i, x, y, z]
-        E = factor * arrays.E + c * curl * inv_eps
-
-        if sigma_E is not None:
-            # update formula for lossy material. Simplifies to Noop for conductivity = 0
-            # for details see Schneider, chapter 3.12
+            E = jnp.stack((Ex, Ey, Ez), axis=0)
             E = E / (1 + c * sigma_E * eta0 * inv_eps / 2)
+        else:
+            factor = 1
+            Ex = factor * arrays.E[0] + c * curl_x * inv_eps[0]
+            Ey = factor * arrays.E[1] + c * curl_y * inv_eps[1]
+            Ez = factor * arrays.E[2] + c * curl_z * inv_eps[2]
+            E = jnp.stack((Ex, Ey, Ez), axis=0)
 
     else:
         # Full anisotropic case: expand inv_eps and sigma_E to (3, 3, Nx, Ny, Nz)
@@ -335,7 +336,7 @@ def update_H(
     sigma_H = arrays.magnetic_conductivity
     c = config.courant_number
     periodic_axes = get_periodic_axes(objects)
-    curl, psi_H = curl_E(
+    curl_x, curl_y, curl_z, psi_H = curl_E(
         config,
         arrays.E,
         arrays.psi_H,
@@ -355,19 +356,21 @@ def update_H(
 
     if not inv_mu_is_full_tensor and not sigma_H_is_full_tensor:
         # Isotropic and diagonal anisotropic case
-        factor = 1
         if sigma_H is not None:
             # update formula for lossy material. Simplifies to Noop for conductivity = 0
             # for details see Schneider, chapter 3.12
             factor = 1 - c * sigma_H / eta0 * inv_mu / 2
-
-        # standard update formula for lossless material
-        H = factor * arrays.H - c * curl * inv_mu
-
-        if sigma_H is not None:
-            # update formula for lossy material. Simplifies to NoOp for conductivity = 0
-            # for details see Schneider, chapter 3.12
+            Hx = factor * arrays.H[0] - c * curl_x * (inv_mu[0] if type(inv_mu) is jax.Array else inv_mu)
+            Hy = factor * arrays.H[1] - c * curl_y * (inv_mu[1] if type(inv_mu) is jax.Array else inv_mu)
+            Hz = factor * arrays.H[2] - c * curl_z * (inv_mu[2] if type(inv_mu) is jax.Array else inv_mu)
+            H = jnp.stack((Hx, Hy, Hz), axis=0)
             H = H / (1 + c * sigma_H / eta0 * inv_mu / 2)
+        else:
+            factor = 1
+            Hx = factor * arrays.H[0] - c * curl_x * (inv_mu[0] if type(inv_mu) is jax.Array else inv_mu)
+            Hy = factor * arrays.H[1] - c * curl_y * (inv_mu[1] if type(inv_mu) is jax.Array else inv_mu)
+            Hz = factor * arrays.H[2] - c * curl_z * (inv_mu[2] if type(inv_mu) is jax.Array else inv_mu)
+            H = jnp.stack((Hx, Hy, Hz), axis=0)
 
     else:
         # Full anisotropic case: expand inv_mu and sigma_H to (3, 3, Nx, Ny, Nz)
