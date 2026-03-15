@@ -68,12 +68,12 @@ def _scatter_psi_component(
     if L_min > 0:
         s = [slice(None)] * 3
         s[axis] = slice(0, L_min)
-        curl_comp = curl_comp.at[tuple(s)].add(sign * psi_min)
+        curl_comp = curl_comp.at[tuple(s)].add(sign * psi_min.astype(jnp.float16))
     if L_max > 0:
         s = [slice(None)] * 3
         s[axis] = slice(-L_max, None)
-        curl_comp = curl_comp.at[tuple(s)].add(sign * psi_max)
-    return curl_comp
+        curl_comp = curl_comp.at[tuple(s)].add(sign * psi_max.astype(jnp.float16))
+    return curl_comp.astype(jnp.float16)
 
 
 def _compute_pml_ab(
@@ -87,11 +87,11 @@ def _compute_pml_ab(
     b_list = []
     a_list = []
     for i in range(6):
-        b_i = jnp.expm1(factor * (sigma[i] / kappa[i] + alpha[i])) + 1
+        b_i = (jnp.expm1(factor * (sigma[i] / kappa[i] + alpha[i])) + 1).astype(jnp.float16)
         a_i = jnp.nan_to_num(
             (b_i - 1.0) * sigma[i] / (sigma[i] + alpha[i] * kappa[i]) / kappa[i],
             nan=0.0, posinf=0.0, neginf=0.0,
-        )
+        ).astype(jnp.float16)
         b_list.append(b_i)
         a_list.append(a_i)
     return b_list, a_list
@@ -157,12 +157,12 @@ def curl_E(
     #dxEz = (jnp.roll(E_pad[2], -1, axis=0) - E_pad[2])[1:-1, 1:-1, 1:-1]
     #dxEy = (jnp.roll(E_pad[1], -1, axis=0) - E_pad[1])[1:-1, 1:-1, 1:-1]
     #dyEx = (jnp.roll(E_pad[0], -1, axis=1) - E_pad[0])[1:-1, 1:-1, 1:-1]
-    dyEz = E_pad[2, 1:-1, 2:, 1:-1] - E_pad[2, 1:-1, 1:-1, 1:-1]
-    dzEy = E_pad[1, 1:-1, 1:-1, 2:] - E_pad[1, 1:-1, 1:-1, 1:-1]
-    dzEx = E_pad[0, 1:-1, 1:-1, 2:] - E_pad[0, 1:-1, 1:-1, 1:-1]
-    dxEz = E_pad[2, 2:, 1:-1, 1:-1] - E_pad[2, 1:-1, 1:-1, 1:-1]
-    dxEy = E_pad[1, 2:, 1:-1, 1:-1] - E_pad[1, 1:-1, 1:-1, 1:-1]
-    dyEx = E_pad[0, 1:-1, 2:, 1:-1] - E_pad[0, 1:-1, 1:-1, 1:-1]
+    dyEz = (E_pad[2, 1:-1, 2:, 1:-1] - E_pad[2, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dzEy = (E_pad[1, 1:-1, 1:-1, 2:] - E_pad[1, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dzEx = (E_pad[0, 1:-1, 1:-1, 2:] - E_pad[0, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dxEz = (E_pad[2, 2:, 1:-1, 1:-1] - E_pad[2, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dxEy = (E_pad[1, 2:, 1:-1, 1:-1] - E_pad[1, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dyEx = (E_pad[0, 1:-1, 2:, 1:-1] - E_pad[0, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
 
     # Derivative fields in the order matching psi components [xy, xz, yz, yx, zx, zy]
     d_fields = (dyEz, dzEy, dzEx, dxEz, dxEy, dyEx)
@@ -183,9 +183,9 @@ def curl_E(
     #             curl_y = (1/kappa[2]*dzEx + psi_Hyz) - (1/kappa[0]*dxEz + psi_Hyx)
     #             curl_z = (1/kappa[0]*dxEy + psi_Hzx) - (1/kappa[1]*dyEx + psi_Hzy)
     # kappa indices 0,1,2 correspond to x,y,z E-field PML
-    curl_x = 1.0 / kappa[1] * dyEz - 1.0 / kappa[2] * dzEy
-    curl_y = 1.0 / kappa[2] * dzEx - 1.0 / kappa[0] * dxEz
-    curl_z = 1.0 / kappa[0] * dxEy - 1.0 / kappa[1] * dyEx
+    curl_x = (1.0 / kappa[1] * dyEz - 1.0 / kappa[2] * dzEy).astype(jnp.float16)
+    curl_y = (1.0 / kappa[2] * dzEx - 1.0 / kappa[0] * dxEz).astype(jnp.float16)
+    curl_z = (1.0 / kappa[0] * dxEy - 1.0 / kappa[1] * dyEx).astype(jnp.float16)
 
     # Scatter sparse psi contributions: +psi[0], -psi[1], +psi[2], -psi[3], +psi[4], -psi[5]
     curl_x = _scatter_psi_component(curl_x, *psi_H_updated[0], axis=1, sign=+1.0)
@@ -195,8 +195,8 @@ def curl_E(
     curl_z = _scatter_psi_component(curl_z, *psi_H_updated[4], axis=0, sign=+1.0)
     curl_z = _scatter_psi_component(curl_z, *psi_H_updated[5], axis=1, sign=-1.0)
 
-    #curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
-    return curl_x, curl_y, curl_z, psi_H_updated
+    curl = jnp.stack((curl_x, curl_y, curl_z), axis=0).astype(jnp.float16)
+    return curl, psi_H_updated
 
 
 def curl_H(
@@ -232,12 +232,12 @@ def curl_H(
     #dxHz = (H_pad[2] - jnp.roll(H_pad[2], 1, axis=0))[1:-1, 1:-1, 1:-1]
     #dxHy = (H_pad[1] - jnp.roll(H_pad[1], 1, axis=0))[1:-1, 1:-1, 1:-1]
     #dyHx = (H_pad[0] - jnp.roll(H_pad[0], 1, axis=1))[1:-1, 1:-1, 1:-1]
-    dyHz = H_pad[2, 1:-1, :-2, 1:-1] - H_pad[2, 1:-1, 1:-1, 1:-1]
-    dzHy = H_pad[1, 1:-1, 1:-1, :-2] - H_pad[1, 1:-1, 1:-1, 1:-1]
-    dzHx = H_pad[0, 1:-1, 1:-1, :-2] - H_pad[0, 1:-1, 1:-1, 1:-1]
-    dxHz = H_pad[2, :-2, 1:-1, 1:-1] - H_pad[2, 1:-1, 1:-1, 1:-1]
-    dxHy = H_pad[1, :-2, 1:-1, 1:-1] - H_pad[1, 1:-1, 1:-1, 1:-1]
-    dyHx = H_pad[0, 1:-1, :-2, 1:-1] - H_pad[0, 1:-1, 1:-1, 1:-1]
+    dyHz = (H_pad[2, 1:-1, :-2, 1:-1] - H_pad[2, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dzHy = (H_pad[1, 1:-1, 1:-1, :-2] - H_pad[1, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dzHx = (H_pad[0, 1:-1, 1:-1, :-2] - H_pad[0, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dxHz = (H_pad[2, :-2, 1:-1, 1:-1] - H_pad[2, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dxHy = (H_pad[1, :-2, 1:-1, 1:-1] - H_pad[1, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
+    dyHx = (H_pad[0, 1:-1, :-2, 1:-1] - H_pad[0, 1:-1, 1:-1, 1:-1]).astype(jnp.float16)
 
     d_fields = (dyHz, dzHy, dzHx, dxHz, dxHy, dyHx)
 
@@ -253,9 +253,9 @@ def curl_H(
 
     psi_E_updated = tuple(psi_E_list)
 
-    curl_x = 1.0 / kappa[1] * dyHz - 1.0 / kappa[2] * dzHy
-    curl_y = 1.0 / kappa[2] * dzHx - 1.0 / kappa[0] * dxHz
-    curl_z = 1.0 / kappa[0] * dxHy - 1.0 / kappa[1] * dyHx
+    curl_x = (1.0 / kappa[1] * dyHz - 1.0 / kappa[2] * dzHy).astype(jnp.float16)
+    curl_y = (1.0 / kappa[2] * dzHx - 1.0 / kappa[0] * dxHz).astype(jnp.float16)
+    curl_z = (1.0 / kappa[0] * dxHy - 1.0 / kappa[1] * dyHx).astype(jnp.float16)
 
     curl_x = _scatter_psi_component(curl_x, *psi_E_updated[0], axis=1, sign=+1.0)
     curl_x = _scatter_psi_component(curl_x, *psi_E_updated[1], axis=2, sign=-1.0)
@@ -264,5 +264,5 @@ def curl_H(
     curl_z = _scatter_psi_component(curl_z, *psi_E_updated[4], axis=0, sign=+1.0)
     curl_z = _scatter_psi_component(curl_z, *psi_E_updated[5], axis=1, sign=-1.0)
 
-    #curl = jnp.stack((curl_x, curl_y, curl_z), axis=0)
-    return curl_x, curl_y, curl_z, psi_E_updated
+    curl = jnp.stack((curl_x, curl_y, curl_z), axis=0).astype(jnp.float16)
+    return curl, psi_E_updated
