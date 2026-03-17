@@ -552,34 +552,18 @@ def tiled_fdtd(
     inv_mu_np = None if mu_is_scalar else np.array(jax.device_get(inv_mu_val))
 
     # PML → GPU (small, stay resident).  Zero the psi fields (reset).
-    # Extract and copy BEFORE freeing the source arrays.
-    psi_E_src = arrays.psi_E
-    psi_H_src = arrays.psi_H
-    alpha_src = arrays.alpha
-    kappa_src = arrays.kappa
-    sigma_src = arrays.sigma
-
+    # Note: alpha/kappa/sigma are 1D coefficient arrays — already tiny.
+    # psi arrays are zeroed.  jax.device_put is a no-op if already on GPU,
+    # so we must NOT delete these source buffers (they'd be the same object).
     psi_E: SparsePsi = jax.device_put(
-        tuple((p_min * 0, p_max * 0) for p_min, p_max in psi_E_src), gpu,
+        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_E), gpu,
     )
     psi_H: SparsePsi = jax.device_put(
-        tuple((p_min * 0, p_max * 0) for p_min, p_max in psi_H_src), gpu,
+        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_H), gpu,
     )
-    alpha = tuple(jax.device_put(a, gpu) for a in alpha_src)
-    kappa = tuple(jax.device_put(k, gpu) for k in kappa_src)
-    sigma_pml = tuple(jax.device_put(s, gpu) for s in sigma_src)
-
-    # Free the original PML source arrays
-    for pair in psi_E_src:
-        _free_jax_buffer(pair[0])
-        _free_jax_buffer(pair[1])
-    for pair in psi_H_src:
-        _free_jax_buffer(pair[0])
-        _free_jax_buffer(pair[1])
-    for arr_tuple in (alpha_src, kappa_src, sigma_src):
-        for a in arr_tuple:
-            _free_jax_buffer(a)
-    del psi_E_src, psi_H_src, alpha_src, kappa_src, sigma_src
+    alpha = tuple(jax.device_put(a, gpu) for a in arrays.alpha)
+    kappa = tuple(jax.device_put(k, gpu) for k in arrays.kappa)
+    sigma_pml = tuple(jax.device_put(s, gpu) for s in arrays.sigma)
 
     b_pml, a_pml = _compute_pml_ab(alpha, kappa, sigma_pml, config)
 
