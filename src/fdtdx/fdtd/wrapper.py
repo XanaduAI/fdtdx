@@ -4,6 +4,7 @@ from fdtdx.config import SimulationConfig
 from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, SimulationState
 from fdtdx.fdtd.fdtd import checkpointed_fdtd, reversible_fdtd
 from fdtdx.fdtd.stop_conditions import StoppingCondition
+from fdtdx.fdtd.tiled_fdtd import tiled_fdtd
 
 
 def run_fdtd(

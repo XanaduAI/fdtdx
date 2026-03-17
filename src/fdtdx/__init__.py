@@ -26,6 +26,7 @@ from fdtdx.core.wavelength import WaveCharacter
 from fdtdx.fdtd.backward import full_backward
 from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, ParameterContainer, SimulationState
 from fdtdx.fdtd.initialization import apply_params, place_objects, resolve_object_constraints
+from fdtdx.fdtd.tiled_fdtd import tiled_fdtd
 from fdtdx.fdtd.wrapper import run_fdtd
 from fdtdx.interfaces.modules import DtypeConversion
 from fdtdx.interfaces.recorder import Recorder, RecordingState
@@ -116,6 +117,7 @@ __all__ = [
     "compute_mode",
     # fdtd
     "run_fdtd",
+    "tiled_fdtd",
     "place_objects",
     "apply_params",
     "full_backward",
