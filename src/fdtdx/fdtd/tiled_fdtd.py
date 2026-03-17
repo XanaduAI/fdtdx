@@ -474,12 +474,58 @@ def _update_H_chunk(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _auto_chunk_size(
+    Nz: int,
+    Nx: int,
+    Ny: int,
+    C_eps: int,
+    has_conductivity: bool,
+    mu_is_scalar: bool,
+    dtype_bytes: int,
+    gpu_budget_bytes: int,
+) -> int:
+    """Pick the largest chunk_size that divides Nz and fits in GPU memory.
+
+    Conservative estimate: per-chunk GPU allocation includes the input arrays
+    (E, H_halo, inv_eps, optionally sigma, inv_mu) plus XLA intermediates
+    for the curl + PML computation (~8x the raw input footprint).
+    """
+    cell_bytes = Nx * Ny * dtype_bytes
+    # Input arrays per z-cell:
+    #   E_chunk:     3 cells
+    #   H_halo:      3 cells (Cz+1, so +3 cells total overhead)
+    #   inv_eps:     C_eps cells
+    #   sigma_E/H:   C_eps cells each (if present)
+    #   inv_mu:      C_eps cells (if array)
+    #   result:      3 cells
+    arrays_per_z = 3 + 3 + C_eps + 3  # E, H_halo, eps, result
+    if has_conductivity:
+        arrays_per_z += C_eps * 2  # sigma_E + sigma_H
+    if not mu_is_scalar:
+        arrays_per_z += C_eps
+
+    # XLA intermediate multiplier (curl derivatives, padding, PML scatter, etc.)
+    xla_multiplier = 8
+    bytes_per_z = arrays_per_z * cell_bytes * xla_multiplier
+    # Fixed overhead for the H_halo extra slice (+1 in z)
+    fixed_overhead = 3 * cell_bytes * xla_multiplier
+
+    max_cz = max(1, int((gpu_budget_bytes - fixed_overhead) // bytes_per_z))
+
+    # Find the largest divisor of Nz that is <= max_cz
+    best = 1
+    for d in range(1, min(max_cz, Nz) + 1):
+        if Nz % d == 0:
+            best = d
+    return best
+
+
 def tiled_fdtd(
     arrays: ArrayContainer,
     objects: ObjectContainer,
     config: SimulationConfig,
     key: jax.Array,
-    chunk_size: int = 64,
+    chunk_size: int | None = None,
 ) -> SimulationState:
     """Run a forward-only FDTD simulation with CPU-GPU tiled streaming.
 
@@ -494,6 +540,8 @@ def tiled_fdtd(
         key: JAX PRNG key (unused in forward-only mode, kept for API compat).
         chunk_size: Number of z-cells per GPU chunk.  Must divide ``Nz``.
             Larger values increase GPU utilisation at the cost of GPU memory.
+            If ``None`` (default), automatically selects the largest chunk size
+            that fits in GPU memory.
 
     .. warning::
         This function **deletes the underlying XLA buffers** of the input
@@ -609,7 +657,32 @@ def tiled_fdtd(
     # 3. Chunk configuration
     # ------------------------------------------------------------------
     Nz = field_shape[3]
-    Cz = chunk_size
+    Nx = field_shape[1]
+    Ny = field_shape[2]
+    C_eps = inv_eps_np.shape[0]
+    dtype_bytes = 4 if np_dtype == np.float32 else 8
+
+    if chunk_size is None:
+        # Query GPU memory and subtract a safety margin for PML + JIT overhead
+        gpu_mem = gpu.memory_stats()
+        if gpu_mem and "bytes_limit" in gpu_mem:
+            total_bytes = gpu_mem["bytes_limit"]
+            in_use = gpu_mem.get("bytes_in_use", 0)
+            available = int((total_bytes - in_use) * 0.75)  # 75% safety margin
+        else:
+            available = 80 * 1024**3  # conservative 80 GB fallback
+        Cz = _auto_chunk_size(
+            Nz, Nx, Ny, C_eps,
+            has_conductivity=has_sigma_E,
+            mu_is_scalar=mu_is_scalar,
+            dtype_bytes=dtype_bytes,
+            gpu_budget_bytes=available,
+        )
+        print(f"Auto chunk_size = {Cz}  ({Nz // Cz} chunks, "
+              f"GPU budget {available / 1024**3:.1f} GB)")
+    else:
+        Cz = chunk_size
+
     if Nz % Cz != 0:
         raise ValueError(
             f"Nz ({Nz}) must be divisible by chunk_size ({Cz}).  "
@@ -640,20 +713,26 @@ def tiled_fdtd(
         # ==============================================================
         print_timestamp()
         print(f"E update starting")
+        import time as _time
         for iz in range(n_chunks):
             z0_int = iz * Cz
             z1_int = z0_int + Cz
             z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
 
+            _t0 = _time.perf_counter()
             H_halo = _build_H_halo_for_E(H_np, z0_int, z1_int, Nz, periodic_z, gpu)
+            _t1 = _time.perf_counter()
             E_chunk = jax.device_put(_cpu_contiguous(E_np[:, :, :, z0_int:z1_int]), gpu)
+            _t2 = _time.perf_counter()
             eps_chunk = jax.device_put(_cpu_contiguous(inv_eps_np[:, :, :, z0_int:z1_int]), gpu)
+            _t3 = _time.perf_counter()
             sig_E_chunk = (
                 jax.device_put(_cpu_contiguous(sigma_E_np[:, :, :, z0_int:z1_int]), gpu)  # type: ignore[index]
                 if has_sigma_E else _dummy_sigma
             )
             kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
 
+            _t4 = _time.perf_counter()
             E_new, psi_E = _update_E_chunk(
                 E_chunk, H_halo, eps_chunk, sig_E_chunk,
                 psi_E, b_pml, a_pml,
@@ -663,8 +742,16 @@ def tiled_fdtd(
                 periodic_axes=periodic_axes,
                 has_conductivity=has_sigma_E,
             )
+            _t5 = _time.perf_counter()
 
             E_np[:, :, :, z0_int:z1_int] = np.asarray(jax.device_get(E_new))
+            _t6 = _time.perf_counter()
+
+            if t < 2 and iz < 3:
+                print(f"  E chunk {iz}: halo={_t1-_t0:.3f}s  E_put={_t2-_t1:.3f}s  "
+                      f"eps_put={_t3-_t2:.3f}s  sig+kz={_t4-_t3:.3f}s  "
+                      f"kernel={_t5-_t4:.3f}s  get+write={_t6-_t5:.3f}s  "
+                      f"total={_t6-_t0:.3f}s")
 
         # --- E-field sources (on GPU, small region only) ---
         print_timestamp()
@@ -684,8 +771,11 @@ def tiled_fdtd(
             z1_int = z0_int + Cz
             z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
 
+            _t0 = _time.perf_counter()
             E_halo = _build_E_halo_for_H(E_np, z0_int, z1_int, Nz, periodic_z, gpu)
+            _t1 = _time.perf_counter()
             H_chunk = jax.device_put(_cpu_contiguous(H_np[:, :, :, z0_int:z1_int]), gpu)
+            _t2 = _time.perf_counter()
 
             if mu_is_scalar:
                 mu_chunk = jnp.asarray(1.0, dtype=config.dtype)
@@ -698,6 +788,7 @@ def tiled_fdtd(
             )
             kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
 
+            _t3 = _time.perf_counter()
             H_new, psi_H = _update_H_chunk(
                 H_chunk, E_halo, mu_chunk, sig_H_chunk,
                 psi_H, b_pml, a_pml,
@@ -708,8 +799,16 @@ def tiled_fdtd(
                 has_conductivity=has_sigma_H,
                 mu_is_scalar=mu_is_scalar,
             )
+            _t4 = _time.perf_counter()
 
             H_np[:, :, :, z0_int:z1_int] = np.asarray(jax.device_get(H_new))
+            _t5 = _time.perf_counter()
+
+            if t < 2 and iz < 3:
+                print(f"  H chunk {iz}: halo={_t1-_t0:.3f}s  H_put={_t2-_t1:.3f}s  "
+                      f"mu+sig+kz={_t3-_t2:.3f}s  "
+                      f"kernel={_t4-_t3:.3f}s  get+write={_t5-_t4:.3f}s  "
+                      f"total={_t5-_t0:.3f}s")
 
         # --- H-field sources (on GPU, small region only) ---
         print_timestamp()
