@@ -79,15 +79,50 @@ def _pin_memory_to_cpu():
         pass
 
 
-def _cpu_contiguous(arr: np.ndarray) -> np.ndarray:
-    """Return a C-contiguous copy suitable for a single bulk DMA transfer.
+def _cuda_pin(arr: np.ndarray) -> bool:
+    """Pin a C-contiguous numpy array as CUDA page-locked host memory.
 
-    On GH200, `np.ascontiguousarray` allocates via malloc on the CPU thread,
-    so first-touch places pages on LPDDR5X.  The contiguous layout lets
-    ``jax.device_put`` issue one large NVLink-C2C DMA instead of many small
-    strided copies.
+    On GH200, this pre-registers pages in the GPU's page table so that
+    ``jax.device_put`` can DMA directly at full NVLink-C2C bandwidth
+    instead of faulting every 4 KB page (~5 μs each).
+    Returns True on success.
     """
-    return np.ascontiguousarray(arr)
+    if not arr.flags['C_CONTIGUOUS']:
+        return False
+    try:
+        import ctypes
+        rt = ctypes.CDLL('libcudart.so')
+        err = rt.cudaHostRegister(
+            ctypes.c_void_p(arr.ctypes.data),
+            ctypes.c_size_t(arr.nbytes),
+            ctypes.c_uint(1),  # cudaHostRegisterPortable
+        )
+        return err == 0
+    except (OSError, Exception):
+        return False
+
+
+def _to_zfirst(arr: np.ndarray) -> np.ndarray:
+    """Transpose (C, Nx, Ny, Nz) → (Nz, C, Nx, Ny) and return C-contiguous."""
+    return np.ascontiguousarray(np.transpose(arr, (3, 0, 1, 2)))
+
+
+def _zf_to_gpu(arr_zf: np.ndarray, gpu) -> jax.Array:
+    """Transfer a z-first numpy slice to GPU and transpose to kernel layout.
+
+    Input:  (Cz, C, Nx, Ny)  — C-contiguous first-axis slice of pinned memory
+    Output: (C, Nx, Ny, Cz)  — on GPU, ready for the kernel
+    """
+    return jnp.transpose(jax.device_put(arr_zf, gpu), (1, 2, 3, 0))
+
+
+def _gpu_to_zf(arr_gpu: jax.Array) -> np.ndarray:
+    """Transfer kernel-layout GPU array to z-first numpy.
+
+    Input:  (C, Nx, Ny, Cz)  — on GPU
+    Output: (Cz, C, Nx, Ny)  — C-contiguous numpy
+    """
+    return np.asarray(jax.device_get(jnp.transpose(arr_gpu, (3, 0, 1, 2))))
 
 
 # ---------------------------------------------------------------------------
@@ -115,17 +150,18 @@ def _build_H_halo_for_E(
     periodic_z: bool,
     gpu,
 ) -> jax.Array:
-    """H chunk with 1-cell LEFT z-halo for curl_H.  Shape (3, Nx, Ny, Cz+1)."""
+    """H chunk with 1-cell LEFT z-halo.
+
+    H_np is z-first: (Nz, 3, Nx, Ny).
+    Returns GPU array in kernel layout: (3, Nx, Ny, Cz+1).
+    """
     if z0 > 0:
-        return jax.device_put(_cpu_contiguous(H_np[:, :, :, z0 - 1 : z1]), gpu)
-    chunk = H_np[:, :, :, 0:z1]
-    if periodic_z:
-        left = H_np[:, :, :, -1:]
+        halo_zf = H_np[z0 - 1 : z1]  # contiguous first-axis slice
     else:
-        left = np.zeros_like(chunk[:, :, :, :1])
-    return jax.device_put(np.ascontiguousarray(
-        np.concatenate([left, chunk], axis=3),
-    ), gpu)
+        chunk = H_np[0:z1]
+        left = H_np[-1:] if periodic_z else np.zeros_like(chunk[:1])
+        halo_zf = np.concatenate([left, chunk], axis=0)
+    return _zf_to_gpu(halo_zf, gpu)
 
 
 def _build_E_halo_for_H(
@@ -136,17 +172,18 @@ def _build_E_halo_for_H(
     periodic_z: bool,
     gpu,
 ) -> jax.Array:
-    """E chunk with 1-cell RIGHT z-halo for curl_E.  Shape (3, Nx, Ny, Cz+1)."""
+    """E chunk with 1-cell RIGHT z-halo.
+
+    E_np is z-first: (Nz, 3, Nx, Ny).
+    Returns GPU array in kernel layout: (3, Nx, Ny, Cz+1).
+    """
     if z1 < Nz:
-        return jax.device_put(_cpu_contiguous(E_np[:, :, :, z0 : z1 + 1]), gpu)
-    chunk = E_np[:, :, :, z0:z1]
-    if periodic_z:
-        right = E_np[:, :, :, :1]
+        halo_zf = E_np[z0 : z1 + 1]  # contiguous first-axis slice
     else:
-        right = np.zeros_like(chunk[:, :, :, :1])
-    return jax.device_put(np.ascontiguousarray(
-        np.concatenate([chunk, right], axis=3),
-    ), gpu)
+        chunk = E_np[z0:z1]
+        right = E_np[:1] if periodic_z else np.zeros_like(chunk[:1])
+        halo_zf = np.concatenate([chunk, right], axis=0)
+    return _zf_to_gpu(halo_zf, gpu)
 
 
 # ---------------------------------------------------------------------------
@@ -583,21 +620,29 @@ def tiled_fdtd(
     # 2. Extract data from ArrayContainer into numpy / GPU arrays,
     #    then FREE the large JAX buffers to avoid holding 2x memory.
     #    Fields are zero (reset), so create numpy directly.
+    #
+    #    All large numpy arrays use Z-FIRST layout: (Nz, C, Nx, Ny).
+    #    First-axis slices are C-contiguous → no strided copies needed.
+    #    Arrays are CUDA-pinned so jax.device_put uses fast DMA.
     # ------------------------------------------------------------------
-    field_shape = arrays.E.shape
-    E_np = np.zeros(field_shape, dtype=np_dtype)
-    H_np = np.zeros(field_shape, dtype=np_dtype)
+    field_shape = arrays.E.shape  # (3, Nx, Ny, Nz) — original layout
+    _, Nx, Ny, Nz = field_shape
 
-    inv_eps_np = np.array(jax.device_get(arrays.inv_permittivities))
+    # Z-first field arrays: (Nz, 3, Nx, Ny)
+    E_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
+    H_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
+
+    # Material arrays: transpose from (C, Nx, Ny, Nz) → (Nz, C, Nx, Ny)
+    inv_eps_np = _to_zfirst(np.array(jax.device_get(arrays.inv_permittivities)))
 
     has_sigma_E = arrays.electric_conductivity is not None
     has_sigma_H = arrays.magnetic_conductivity is not None
-    sigma_E_np = np.array(jax.device_get(arrays.electric_conductivity)) if has_sigma_E else None
-    sigma_H_np = np.array(jax.device_get(arrays.magnetic_conductivity)) if has_sigma_H else None
+    sigma_E_np = _to_zfirst(np.array(jax.device_get(arrays.electric_conductivity))) if has_sigma_E else None
+    sigma_H_np = _to_zfirst(np.array(jax.device_get(arrays.magnetic_conductivity))) if has_sigma_H else None
 
     inv_mu_val = arrays.inv_permeabilities
     mu_is_scalar = not isinstance(inv_mu_val, jax.Array) or inv_mu_val.ndim == 0
-    inv_mu_np = None if mu_is_scalar else np.array(jax.device_get(inv_mu_val))
+    inv_mu_np = None if mu_is_scalar else _to_zfirst(np.array(jax.device_get(inv_mu_val)))
 
     # PML → GPU (small, stay resident).  Zero the psi fields (reset).
     # Note: alpha/kappa/sigma are 1D coefficient arrays — already tiny.
@@ -620,6 +665,9 @@ def tiled_fdtd(
     kappa_z_full = kappa[2]  # (1, 1, Nz) — sliced per chunk
 
     has_detectors = bool(objects.forward_detectors)
+
+    # Save recording_state before deleting JAX buffers
+    _saved_recording_state = arrays.recording_state
 
     # Capture scalar inv_permeabilities value before freeing JAX buffers.
     if mu_is_scalar:
@@ -653,13 +701,20 @@ def tiled_fdtd(
     del inv_eps
     gc.collect()
 
+    # CUDA-pin the large z-first numpy arrays for fast DMA
+    for _arr in [E_np, H_np, inv_eps_np]:
+        _cuda_pin(_arr)
+    if sigma_E_np is not None:
+        _cuda_pin(sigma_E_np)
+    if sigma_H_np is not None:
+        _cuda_pin(sigma_H_np)
+    if inv_mu_np is not None:
+        _cuda_pin(inv_mu_np)
+
     # ------------------------------------------------------------------
     # 3. Chunk configuration
     # ------------------------------------------------------------------
-    Nz = field_shape[3]
-    Nx = field_shape[1]
-    Ny = field_shape[2]
-    C_eps = inv_eps_np.shape[0]
+    C_eps = inv_eps_np.shape[1]  # z-first: (Nz, C, Nx, Ny)
     dtype_bytes = 4 if np_dtype == np.float32 else 8
 
     if chunk_size is None:
@@ -722,12 +777,12 @@ def tiled_fdtd(
             _t0 = _time.perf_counter()
             H_halo = _build_H_halo_for_E(H_np, z0_int, z1_int, Nz, periodic_z, gpu)
             _t1 = _time.perf_counter()
-            E_chunk = jax.device_put(_cpu_contiguous(E_np[:, :, :, z0_int:z1_int]), gpu)
+            E_chunk = _zf_to_gpu(E_np[z0_int:z1_int], gpu)
             _t2 = _time.perf_counter()
-            eps_chunk = jax.device_put(_cpu_contiguous(inv_eps_np[:, :, :, z0_int:z1_int]), gpu)
+            eps_chunk = _zf_to_gpu(inv_eps_np[z0_int:z1_int], gpu)
             _t3 = _time.perf_counter()
             sig_E_chunk = (
-                jax.device_put(_cpu_contiguous(sigma_E_np[:, :, :, z0_int:z1_int]), gpu)  # type: ignore[index]
+                _zf_to_gpu(sigma_E_np[z0_int:z1_int], gpu)  # type: ignore[index]
                 if has_sigma_E else _dummy_sigma
             )
             kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
@@ -744,7 +799,7 @@ def tiled_fdtd(
             )
             _t5 = _time.perf_counter()
 
-            E_np[:, :, :, z0_int:z1_int] = np.asarray(jax.device_get(E_new))
+            E_np[z0_int:z1_int] = _gpu_to_zf(E_new)
             _t6 = _time.perf_counter()
 
             if t < 2 and iz < 3:
@@ -774,16 +829,16 @@ def tiled_fdtd(
             _t0 = _time.perf_counter()
             E_halo = _build_E_halo_for_H(E_np, z0_int, z1_int, Nz, periodic_z, gpu)
             _t1 = _time.perf_counter()
-            H_chunk = jax.device_put(_cpu_contiguous(H_np[:, :, :, z0_int:z1_int]), gpu)
+            H_chunk = _zf_to_gpu(H_np[z0_int:z1_int], gpu)
             _t2 = _time.perf_counter()
 
             if mu_is_scalar:
                 mu_chunk = jnp.asarray(1.0, dtype=config.dtype)
             else:
-                mu_chunk = jax.device_put(_cpu_contiguous(inv_mu_np[:, :, :, z0_int:z1_int]), gpu)  # type: ignore[index]
+                mu_chunk = _zf_to_gpu(inv_mu_np[z0_int:z1_int], gpu)  # type: ignore[index]
 
             sig_H_chunk = (
-                jax.device_put(_cpu_contiguous(sigma_H_np[:, :, :, z0_int:z1_int]), gpu)  # type: ignore[index]
+                _zf_to_gpu(sigma_H_np[z0_int:z1_int], gpu)  # type: ignore[index]
                 if has_sigma_H else _dummy_sigma
             )
             kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
@@ -801,7 +856,7 @@ def tiled_fdtd(
             )
             _t4 = _time.perf_counter()
 
-            H_np[:, :, :, z0_int:z1_int] = np.asarray(jax.device_get(H_new))
+            H_np[z0_int:z1_int] = _gpu_to_zf(H_new)
             _t5 = _time.perf_counter()
 
             if t < 2 and iz < 3:
@@ -832,27 +887,42 @@ def tiled_fdtd(
 
     # ------------------------------------------------------------------
     # 5. Reconstruct output ArrayContainer
-    #    Keep large arrays on CPU — they don't fit on GPU.
+    #    Transpose z-first numpy → original (C, Nx, Ny, Nz) layout.
+    #    We cannot use arrays.aset() because the input arrays' XLA
+    #    buffers were deleted — tree_copy would crash.  Construct fresh.
     # ------------------------------------------------------------------
-    final_E = jnp.asarray(E_np)
-    final_H = jnp.asarray(H_np)
-    final_inv_eps = jnp.asarray(inv_eps_np)
+    final_E = jnp.asarray(np.ascontiguousarray(np.transpose(E_np, (1, 2, 3, 0))))
+    final_H = jnp.asarray(np.ascontiguousarray(np.transpose(H_np, (1, 2, 3, 0))))
+    final_inv_eps = jnp.asarray(np.ascontiguousarray(np.transpose(inv_eps_np, (1, 2, 3, 0))))
 
-    out = arrays
-    out = out.aset("E", final_E)
-    out = out.aset("H", final_H)
-    out = out.aset("inv_permittivities", final_inv_eps)
-    out = out.aset("psi_E", psi_E)
-    out = out.aset("psi_H", psi_H)
-    out = out.aset("detector_states", detector_states_gpu)
-    if has_sigma_E:
-        out = out.aset("electric_conductivity", jnp.asarray(sigma_E_np))
-    if has_sigma_H:
-        out = out.aset("magnetic_conductivity", jnp.asarray(sigma_H_np))
+    final_sigma_E = (
+        jnp.asarray(np.ascontiguousarray(np.transpose(sigma_E_np, (1, 2, 3, 0))))  # type: ignore[arg-type]
+        if has_sigma_E else None
+    )
+    final_sigma_H = (
+        jnp.asarray(np.ascontiguousarray(np.transpose(sigma_H_np, (1, 2, 3, 0))))  # type: ignore[arg-type]
+        if has_sigma_H else None
+    )
     if not mu_is_scalar:
-        out = out.aset("inv_permeabilities", jnp.asarray(inv_mu_np))
+        final_inv_mu = jnp.asarray(np.ascontiguousarray(np.transpose(inv_mu_np, (1, 2, 3, 0))))  # type: ignore[arg-type]
     else:
-        out = out.aset("inv_permeabilities", jnp.asarray(inv_mu_scalar))
+        final_inv_mu = jnp.asarray(inv_mu_scalar)
+
+    out = ArrayContainer(
+        E=final_E,
+        H=final_H,
+        psi_E=psi_E,
+        psi_H=psi_H,
+        alpha=alpha,
+        kappa=kappa,
+        sigma=sigma_pml,
+        inv_permittivities=final_inv_eps,
+        inv_permeabilities=final_inv_mu,
+        detector_states=detector_states_gpu,
+        recording_state=_saved_recording_state,
+        electric_conductivity=final_sigma_E,
+        magnetic_conductivity=final_sigma_H,
+    )
 
     final_time = jnp.asarray(config.time_steps_total, dtype=jnp.int32)
     return (final_time, out)
@@ -873,9 +943,10 @@ def _remap_to_gpu(
     inv_mu_scalar: float | None,
     gpu,
 ):
-    """Extract *obj*'s spatial region from numpy arrays, send to GPU,
+    """Extract *obj*'s spatial region from z-first numpy arrays, send to GPU,
     and return (remapped_obj, field_gpu, eps_gpu, mu_gpu).
 
+    field_np is (Nz, C, Nx, Ny).  The GPU arrays have kernel layout (C, dx, dy, dz).
     The remapped object has ``_grid_slice_tuple`` set to
     ``((0,dx),(0,dy),(0,dz))`` so ``grid_slice`` addresses the full
     small array.
@@ -886,19 +957,25 @@ def _remap_to_gpu(
     dz = gst[2][1] - gst[2][0]
     sx, sy, sz = obj.grid_slice
 
-    field_gpu = jax.device_put(
-        jnp.asarray(np.ascontiguousarray(field_np[:, sx, sy, sz])), gpu,
+    # z-first: (Nz, C, Nx, Ny) → slice [sz, :, sx, sy] → (dz, C, dx, dy)
+    # then transpose to kernel layout (C, dx, dy, dz)
+    field_region = np.ascontiguousarray(
+        np.transpose(field_np[sz, :, sx, sy], (1, 2, 3, 0))
     )
-    eps_gpu = jax.device_put(
-        jnp.asarray(np.ascontiguousarray(inv_eps_np[:, sx, sy, sz])), gpu,
+    field_gpu = jax.device_put(jnp.asarray(field_region), gpu)
+
+    eps_region = np.ascontiguousarray(
+        np.transpose(inv_eps_np[sz, :, sx, sy], (1, 2, 3, 0))
     )
+    eps_gpu = jax.device_put(jnp.asarray(eps_region), gpu)
+
     if mu_is_scalar:
         mu_gpu = inv_mu_scalar
     else:
-        mu_gpu = jax.device_put(
-            jnp.asarray(np.ascontiguousarray(inv_mu_np[:, sx, sy, sz])),  # type: ignore[index]
-            gpu,
+        mu_region = np.ascontiguousarray(
+            np.transpose(inv_mu_np[sz, :, sx, sy], (1, 2, 3, 0))  # type: ignore[index]
         )
+        mu_gpu = jax.device_put(jnp.asarray(mu_region), gpu)
 
     obj_remap = obj.aset("_grid_slice_tuple", ((0, dx), (0, dy), (0, dz)))
     return obj_remap, field_gpu, eps_gpu, mu_gpu
@@ -933,7 +1010,10 @@ def _apply_sources_E_gpu(
             time_step=adj,
             inverse=False,
         )
-        E_np[:, sx, sy, sz] = np.asarray(jax.device_get(E_updated))
+        # kernel layout (3, dx, dy, dz) → z-first (dz, 3, dx, dy)
+        E_np[sz, :, sx, sy] = np.transpose(
+            np.asarray(jax.device_get(E_updated)), (3, 0, 1, 2)
+        )
 
 
 def _apply_sources_H_gpu(
@@ -965,7 +1045,9 @@ def _apply_sources_H_gpu(
             time_step=adj + 0.5,
             inverse=False,
         )
-        H_np[:, sx, sy, sz] = np.asarray(jax.device_get(H_updated))
+        H_np[sz, :, sx, sy] = np.transpose(
+            np.asarray(jax.device_get(H_updated)), (3, 0, 1, 2)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1002,9 +1084,10 @@ def _update_detectors_gpu(
             mu_is_scalar, inv_mu_scalar, gpu,
         )
         sx, sy, sz = d.grid_slice
-        H_gpu = jax.device_put(
-            jnp.asarray(np.ascontiguousarray(H_np[:, sx, sy, sz])), gpu,
+        H_region = np.ascontiguousarray(
+            np.transpose(H_np[sz, :, sx, sy], (1, 2, 3, 0))
         )
+        H_gpu = jax.device_put(jnp.asarray(H_region), gpu)
 
         detector_states[d.name] = d_remap.update(
             time_step=time_step,
