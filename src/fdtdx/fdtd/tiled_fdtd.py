@@ -43,6 +43,22 @@ def print_timestamp():
 # Memory placement helpers for GH200
 # ---------------------------------------------------------------------------
 
+def _free_jax_buffer(arr) -> None:
+    """Explicitly free a JAX array's underlying XLA buffer.
+
+    On GH200, the caller's reference to the input ArrayContainer keeps
+    large JAX arrays alive on GPU even after tiled_fdtd copies them to
+    numpy.  This function invalidates the buffer so GPU HBM is reclaimed
+    immediately.  Any subsequent access to the array will raise an error.
+    """
+    if not isinstance(arr, jax.Array):
+        return
+    try:
+        arr.delete()
+    except Exception:
+        pass
+
+
 def _pin_memory_to_cpu():
     """On GH200 in NUMA mode, GPU HBM is exposed as a NUMA node and the OS
     can migrate malloc'd pages to HBM.  Call this early to bind all
@@ -479,6 +495,12 @@ def tiled_fdtd(
         chunk_size: Number of z-cells per GPU chunk.  Must divide ``Nz``.
             Larger values increase GPU utilisation at the cost of GPU memory.
 
+    .. warning::
+        This function **deletes the underlying XLA buffers** of the input
+        ``arrays`` to free GPU memory.  The caller's reference to the input
+        ``ArrayContainer`` will contain invalidated arrays after this call.
+        Always use the returned ``arrays`` for subsequent work.
+
     Returns:
         ``(time_step, arrays)`` — same shape as ``checkpointed_fdtd``.
     """
@@ -530,15 +552,34 @@ def tiled_fdtd(
     inv_mu_np = None if mu_is_scalar else np.array(jax.device_get(inv_mu_val))
 
     # PML → GPU (small, stay resident).  Zero the psi fields (reset).
+    # Extract and copy BEFORE freeing the source arrays.
+    psi_E_src = arrays.psi_E
+    psi_H_src = arrays.psi_H
+    alpha_src = arrays.alpha
+    kappa_src = arrays.kappa
+    sigma_src = arrays.sigma
+
     psi_E: SparsePsi = jax.device_put(
-        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_E), gpu,
+        tuple((p_min * 0, p_max * 0) for p_min, p_max in psi_E_src), gpu,
     )
     psi_H: SparsePsi = jax.device_put(
-        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_H), gpu,
+        tuple((p_min * 0, p_max * 0) for p_min, p_max in psi_H_src), gpu,
     )
-    alpha = tuple(jax.device_put(a, gpu) for a in arrays.alpha)
-    kappa = tuple(jax.device_put(k, gpu) for k in arrays.kappa)
-    sigma_pml = tuple(jax.device_put(s, gpu) for s in arrays.sigma)
+    alpha = tuple(jax.device_put(a, gpu) for a in alpha_src)
+    kappa = tuple(jax.device_put(k, gpu) for k in kappa_src)
+    sigma_pml = tuple(jax.device_put(s, gpu) for s in sigma_src)
+
+    # Free the original PML source arrays
+    for pair in psi_E_src:
+        _free_jax_buffer(pair[0])
+        _free_jax_buffer(pair[1])
+    for pair in psi_H_src:
+        _free_jax_buffer(pair[0])
+        _free_jax_buffer(pair[1])
+    for arr_tuple in (alpha_src, kappa_src, sigma_src):
+        for a in arr_tuple:
+            _free_jax_buffer(a)
+    del psi_E_src, psi_H_src, alpha_src, kappa_src, sigma_src
 
     b_pml, a_pml = _compute_pml_ab(alpha, kappa, sigma_pml, config)
 
@@ -549,20 +590,35 @@ def tiled_fdtd(
     has_detectors = bool(objects.forward_detectors)
 
     # Capture scalar inv_permeabilities value before freeing JAX buffers.
-    # For the array case we already have inv_mu_np.
     if mu_is_scalar:
         inv_mu_scalar = float(jax.device_get(jnp.asarray(inv_mu_val)))
     else:
         inv_mu_scalar = None
 
-    # Detector states — zero (reset), keep on GPU to avoid per-step transfers
-    detector_states_gpu: dict = {
-        k: {k2: jax.device_put(v2 * 0, gpu) for k2, v2 in v.items()}
-        for k, v in arrays.detector_states.items()
-    }
+    # Detector states — zero (reset), keep on GPU to avoid per-step transfers.
+    # Free original detector state buffers after zeroing and moving to GPU.
+    detector_states_gpu: dict = {}
+    for k, v in arrays.detector_states.items():
+        detector_states_gpu[k] = {}
+        for k2, v2 in v.items():
+            detector_states_gpu[k][k2] = jax.device_put(v2 * 0, gpu)
+            _free_jax_buffer(v2)
 
-    # FREE large JAX buffers — we've copied everything we need into
-    # numpy / GPU arrays above.  This is critical to avoid 2× memory.
+    # FREE large JAX/GPU buffers.  The caller's reference to the original
+    # ArrayContainer keeps the JAX arrays alive on GPU even after we
+    # reassign our local `arrays`.  We must explicitly delete the
+    # underlying XLA buffers so GPU HBM is reclaimed immediately.
+    _free_jax_buffer(arrays.E)
+    _free_jax_buffer(arrays.H)
+    _free_jax_buffer(arrays.inv_permittivities)
+    if has_sigma_E:
+        _free_jax_buffer(arrays.electric_conductivity)
+    if has_sigma_H:
+        _free_jax_buffer(arrays.magnetic_conductivity)
+    if not mu_is_scalar:
+        _free_jax_buffer(inv_mu_val)
+    del inv_mu_val
+
     _ph = jnp.zeros((1,), dtype=config.dtype)
     arrays = arrays.aset("E", _ph)
     arrays = arrays.aset("H", _ph)
@@ -573,7 +629,7 @@ def tiled_fdtd(
         arrays = arrays.aset("magnetic_conductivity", _ph)
     if not mu_is_scalar:
         arrays = arrays.aset("inv_permeabilities", _ph)
-    del inv_mu_val
+    del inv_eps
     gc.collect()
 
     # ------------------------------------------------------------------
