@@ -524,7 +524,7 @@ def tiled_fdtd(
     # 6. Time loop
     # ------------------------------------------------------------------
     for t in range(config.time_steps_total):
-        if t % 100 == 0:
+        if t % 1 == 0:
             print(f"Time step {t} of {config.time_steps_total}")
         time_step = jnp.asarray(t, dtype=jnp.int32)
         H_prev_np = H_np.copy()
