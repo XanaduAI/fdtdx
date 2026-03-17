@@ -10,6 +10,7 @@ each chunk triggers a single bulk DMA transfer at full NVLink bandwidth.
 """
 
 from functools import partial
+import datetime
 
 import jax
 import jax.lax as lax
@@ -33,6 +34,44 @@ from fdtdx.fdtd.container import (
     SimulationState,
 )
 from fdtdx.fdtd.update import get_periodic_axes
+
+def print_timestamp():
+    print(f"Timestamp: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}")
+
+
+# ---------------------------------------------------------------------------
+# Memory placement helpers for GH200
+# ---------------------------------------------------------------------------
+
+def _pin_memory_to_cpu():
+    """On GH200 in NUMA mode, GPU HBM is exposed as a NUMA node and the OS
+    can migrate malloc'd pages to HBM.  Call this early to bind all
+    subsequent allocations to the CPU's LPDDR5X NUMA node.
+
+    This is a no-op if libnuma is unavailable or the system has only one
+    NUMA node (non-GH200).
+    """
+    import ctypes
+    import ctypes.util
+    try:
+        lib = ctypes.CDLL(ctypes.util.find_library("numa"))
+        n_nodes = lib.numa_max_node() + 1
+        if n_nodes <= 1:
+            return
+        lib.numa_set_preferred(0)
+    except (OSError, TypeError):
+        pass
+
+
+def _cpu_contiguous(arr: np.ndarray) -> np.ndarray:
+    """Return a C-contiguous copy suitable for a single bulk DMA transfer.
+
+    On GH200, `np.ascontiguousarray` allocates via malloc on the CPU thread,
+    so first-touch places pages on LPDDR5X.  The contiguous layout lets
+    ``jax.device_put`` issue one large NVLink-C2C DMA instead of many small
+    strided copies.
+    """
+    return np.ascontiguousarray(arr)
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +101,15 @@ def _build_H_halo_for_E(
 ) -> jax.Array:
     """H chunk with 1-cell LEFT z-halo for curl_H.  Shape (3, Nx, Ny, Cz+1)."""
     if z0 > 0:
-        return jax.device_put(H_np[:, :, :, z0 - 1 : z1], gpu)
+        return jax.device_put(_cpu_contiguous(H_np[:, :, :, z0 - 1 : z1]), gpu)
     chunk = H_np[:, :, :, 0:z1]
     if periodic_z:
         left = H_np[:, :, :, -1:]
     else:
         left = np.zeros_like(chunk[:, :, :, :1])
-    return jax.device_put(np.concatenate([left, chunk], axis=3), gpu)
+    return jax.device_put(np.ascontiguousarray(
+        np.concatenate([left, chunk], axis=3),
+    ), gpu)
 
 
 def _build_E_halo_for_H(
@@ -81,13 +122,15 @@ def _build_E_halo_for_H(
 ) -> jax.Array:
     """E chunk with 1-cell RIGHT z-halo for curl_E.  Shape (3, Nx, Ny, Cz+1)."""
     if z1 < Nz:
-        return jax.device_put(E_np[:, :, :, z0 : z1 + 1], gpu)
+        return jax.device_put(_cpu_contiguous(E_np[:, :, :, z0 : z1 + 1]), gpu)
     chunk = E_np[:, :, :, z0:z1]
     if periodic_z:
         right = E_np[:, :, :, :1]
     else:
         right = np.zeros_like(chunk[:, :, :, :1])
-    return jax.device_put(np.concatenate([chunk, right], axis=3), gpu)
+    return jax.device_put(np.ascontiguousarray(
+        np.concatenate([chunk, right], axis=3),
+    ), gpu)
 
 
 # ---------------------------------------------------------------------------
@@ -439,9 +482,15 @@ def tiled_fdtd(
     Returns:
         ``(time_step, arrays)`` — same shape as ``checkpointed_fdtd``.
     """
+    print_timestamp()
+    print("Starting tiled_fdtd")
+
     import gc
 
     del key  # unused in forward-only
+
+    # On GH200 in NUMA mode, ensure allocations land on CPU LPDDR5X
+    _pin_memory_to_cpu()
 
     # ------------------------------------------------------------------
     # 0. Validate
@@ -458,7 +507,6 @@ def tiled_fdtd(
     # 1. Device handles
     # ------------------------------------------------------------------
     gpu = jax.devices("gpu")[0]
-    cpu = jax.devices("cpu")[0]
     np_dtype = np.float32 if config.dtype == jnp.float32 else np.float64
 
     # ------------------------------------------------------------------
@@ -498,15 +546,20 @@ def tiled_fdtd(
     kappa_y = kappa[1]   # (1, Ny, 1)
     kappa_z_full = kappa[2]  # (1, 1, Nz) — sliced per chunk
 
-    # Detector states — zero (reset), keep on CPU
-    detector_states: dict = {
-        k: {k2: jax.device_put(v2 * 0, cpu) for k2, v2 in v.items()}
-        for k, v in arrays.detector_states.items()
-    }
     has_detectors = bool(objects.forward_detectors)
 
-    # Cache inv_permeabilities for source calls (small scalar or freed below)
-    inv_mu_for_sources = arrays.inv_permeabilities
+    # Capture scalar inv_permeabilities value before freeing JAX buffers.
+    # For the array case we already have inv_mu_np.
+    if mu_is_scalar:
+        inv_mu_scalar = float(jax.device_get(jnp.asarray(inv_mu_val)))
+    else:
+        inv_mu_scalar = None
+
+    # Detector states — zero (reset), keep on GPU to avoid per-step transfers
+    detector_states_gpu: dict = {
+        k: {k2: jax.device_put(v2 * 0, gpu) for k2, v2 in v.items()}
+        for k, v in arrays.detector_states.items()
+    }
 
     # FREE large JAX buffers — we've copied everything we need into
     # numpy / GPU arrays above.  This is critical to avoid 2× memory.
@@ -520,6 +573,7 @@ def tiled_fdtd(
         arrays = arrays.aset("magnetic_conductivity", _ph)
     if not mu_is_scalar:
         arrays = arrays.aset("inv_permeabilities", _ph)
+    del inv_mu_val
     gc.collect()
 
     # ------------------------------------------------------------------
@@ -540,27 +594,33 @@ def tiled_fdtd(
 
     _dummy_sigma = jnp.zeros((1,), dtype=config.dtype)
 
+    print_timestamp()
+    print(f"Time loop starting")
+
     # ------------------------------------------------------------------
     # 4. Time loop
     # ------------------------------------------------------------------
     for t in range(config.time_steps_total):
         if t % 1 == 0:
+            print_timestamp()
             print(f"Time step {t} of {config.time_steps_total}")
         time_step = jnp.asarray(t, dtype=jnp.int32)
 
         # ==============================================================
         # Phase 1 — E update  (reads H, writes E)
         # ==============================================================
+        print_timestamp()
+        print(f"E update starting")
         for iz in range(n_chunks):
             z0_int = iz * Cz
             z1_int = z0_int + Cz
             z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
 
             H_halo = _build_H_halo_for_E(H_np, z0_int, z1_int, Nz, periodic_z, gpu)
-            E_chunk = jax.device_put(E_np[:, :, :, z0_int:z1_int], gpu)
-            eps_chunk = jax.device_put(inv_eps_np[:, :, :, z0_int:z1_int], gpu)
+            E_chunk = jax.device_put(_cpu_contiguous(E_np[:, :, :, z0_int:z1_int]), gpu)
+            eps_chunk = jax.device_put(_cpu_contiguous(inv_eps_np[:, :, :, z0_int:z1_int]), gpu)
             sig_E_chunk = (
-                jax.device_put(sigma_E_np[:, :, :, z0_int:z1_int], gpu)  # type: ignore[index]
+                jax.device_put(_cpu_contiguous(sigma_E_np[:, :, :, z0_int:z1_int]), gpu)  # type: ignore[index]
                 if has_sigma_E else _dummy_sigma
             )
             kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
@@ -577,32 +637,34 @@ def tiled_fdtd(
 
             E_np[:, :, :, z0_int:z1_int] = np.asarray(jax.device_get(E_new))
 
-        # --- E-field sources (on CPU, after all chunks) ---
-        _apply_sources_E(
-            E_np, inv_eps_np, inv_mu_for_sources,
-            objects, time_step, config.dtype,
+        # --- E-field sources (on GPU, small region only) ---
+        print_timestamp()
+        print(f"E-field sources starting")
+        _apply_sources_E_gpu(
+            E_np, inv_eps_np, inv_mu_np, mu_is_scalar, inv_mu_scalar,
+            objects, time_step, config.dtype, gpu,
         )
 
         # ==============================================================
         # Phase 2 — H update  (reads E, writes H)
         # ==============================================================
+        print_timestamp()
+        print(f"H update starting")
         for iz in range(n_chunks):
-            if iz % 1 == 0:
-                print(f"H update chunk {iz} of {n_chunks}")
             z0_int = iz * Cz
             z1_int = z0_int + Cz
             z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
 
             E_halo = _build_E_halo_for_H(E_np, z0_int, z1_int, Nz, periodic_z, gpu)
-            H_chunk = jax.device_put(H_np[:, :, :, z0_int:z1_int], gpu)
+            H_chunk = jax.device_put(_cpu_contiguous(H_np[:, :, :, z0_int:z1_int]), gpu)
 
             if mu_is_scalar:
                 mu_chunk = jnp.asarray(1.0, dtype=config.dtype)
             else:
-                mu_chunk = jax.device_put(inv_mu_np[:, :, :, z0_int:z1_int], gpu)  # type: ignore[index]
+                mu_chunk = jax.device_put(_cpu_contiguous(inv_mu_np[:, :, :, z0_int:z1_int]), gpu)  # type: ignore[index]
 
             sig_H_chunk = (
-                jax.device_put(sigma_H_np[:, :, :, z0_int:z1_int], gpu)  # type: ignore[index]
+                jax.device_put(_cpu_contiguous(sigma_H_np[:, :, :, z0_int:z1_int]), gpu)  # type: ignore[index]
                 if has_sigma_H else _dummy_sigma
             )
             kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
@@ -620,20 +682,24 @@ def tiled_fdtd(
 
             H_np[:, :, :, z0_int:z1_int] = np.asarray(jax.device_get(H_new))
 
-        # --- H-field sources (on CPU, after all chunks) ---
-        _apply_sources_H(
-            H_np, inv_eps_np, inv_mu_for_sources,
-            objects, time_step, config.dtype,
+        # --- H-field sources (on GPU, small region only) ---
+        print_timestamp()
+        print(f"H-field sources starting")
+        _apply_sources_H_gpu(
+            H_np, inv_eps_np, inv_mu_np, mu_is_scalar, inv_mu_scalar,
+            objects, time_step, config.dtype, gpu,
         )
 
         # ==============================================================
-        # Detector update — lightweight per-detector loop that avoids
-        # the full-grid interpolate_fields() allocation.
+        # Detector update (on GPU, small sliced regions only)
         # ==============================================================
+        print_timestamp()
+        print(f"Detector update starting")
         if has_detectors:
-            detector_states = _update_detectors_lightweight(
-                E_np, H_np, inv_eps_np, inv_mu_for_sources,
-                detector_states, objects, time_step,
+            detector_states_gpu = _update_detectors_gpu(
+                E_np, H_np, inv_eps_np, inv_mu_np,
+                mu_is_scalar, inv_mu_scalar,
+                detector_states_gpu, objects, time_step, gpu,
             )
 
     # ------------------------------------------------------------------
@@ -650,122 +716,175 @@ def tiled_fdtd(
     out = out.aset("inv_permittivities", final_inv_eps)
     out = out.aset("psi_E", psi_E)
     out = out.aset("psi_H", psi_H)
-    out = out.aset("detector_states", detector_states)
+    out = out.aset("detector_states", detector_states_gpu)
     if has_sigma_E:
         out = out.aset("electric_conductivity", jnp.asarray(sigma_E_np))
     if has_sigma_H:
         out = out.aset("magnetic_conductivity", jnp.asarray(sigma_H_np))
     if not mu_is_scalar:
         out = out.aset("inv_permeabilities", jnp.asarray(inv_mu_np))
+    else:
+        out = out.aset("inv_permeabilities", jnp.asarray(inv_mu_scalar))
 
     final_time = jnp.asarray(config.time_steps_total, dtype=jnp.int32)
     return (final_time, out)
 
 
 # ---------------------------------------------------------------------------
-# Source helpers — use jnp.asarray (zero-copy view of numpy) so the only
-# allocation is the new array from source.update_{E,H}'s .at[].set().
+# GPU source helpers — extract the source's small spatial region from numpy,
+# send it to GPU, remap grid_slice to zero-based, and run source.update_*
+# on GPU.  Only the tiny source region is transferred, not the full grid.
 # ---------------------------------------------------------------------------
 
-def _apply_sources_E(
+def _remap_to_gpu(
+    obj,
+    field_np: np.ndarray,
+    inv_eps_np: np.ndarray,
+    inv_mu_np: np.ndarray | None,
+    mu_is_scalar: bool,
+    inv_mu_scalar: float | None,
+    gpu,
+):
+    """Extract *obj*'s spatial region from numpy arrays, send to GPU,
+    and return (remapped_obj, field_gpu, eps_gpu, mu_gpu).
+
+    The remapped object has ``_grid_slice_tuple`` set to
+    ``((0,dx),(0,dy),(0,dz))`` so ``grid_slice`` addresses the full
+    small array.
+    """
+    gst = obj._grid_slice_tuple
+    dx = gst[0][1] - gst[0][0]
+    dy = gst[1][1] - gst[1][0]
+    dz = gst[2][1] - gst[2][0]
+    sx, sy, sz = obj.grid_slice
+
+    field_gpu = jax.device_put(
+        jnp.asarray(np.ascontiguousarray(field_np[:, sx, sy, sz])), gpu,
+    )
+    eps_gpu = jax.device_put(
+        jnp.asarray(np.ascontiguousarray(inv_eps_np[:, sx, sy, sz])), gpu,
+    )
+    if mu_is_scalar:
+        mu_gpu = inv_mu_scalar
+    else:
+        mu_gpu = jax.device_put(
+            jnp.asarray(np.ascontiguousarray(inv_mu_np[:, sx, sy, sz])),  # type: ignore[index]
+            gpu,
+        )
+
+    obj_remap = obj.aset("_grid_slice_tuple", ((0, dx), (0, dy), (0, dz)))
+    return obj_remap, field_gpu, eps_gpu, mu_gpu
+
+
+def _apply_sources_E_gpu(
     E_np: np.ndarray,
     inv_eps_np: np.ndarray,
-    inv_permeabilities,
+    inv_mu_np: np.ndarray | None,
+    mu_is_scalar: bool,
+    inv_mu_scalar: float | None,
     objects: ObjectContainer,
     time_step: jax.Array,
     dtype,
+    gpu,
 ) -> None:
-    """Apply all active E-field sources to *E_np* in-place."""
-    active = [
-        s for s in objects.sources
-        if bool(jax.device_get(s.is_on_at_time_step(time_step)))
-    ]
-    if not active:
-        return
-
-    E_jax = jnp.asarray(E_np, dtype=dtype)
-    inv_eps_jax = jnp.asarray(inv_eps_np, dtype=dtype)
-    for source in active:
+    """Apply E-field sources on GPU using only the source's spatial region."""
+    for source in objects.sources:
+        if not bool(jax.device_get(source.is_on_at_time_step(time_step))):
+            continue
         adj = source.adjust_time_step_by_on_off(time_step)
-        E_jax = source.update_E(
-            E=E_jax,
-            inv_permittivities=inv_eps_jax,
-            inv_permeabilities=inv_permeabilities,
+        sx, sy, sz = source.grid_slice
+
+        src_remap, E_gpu, eps_gpu, mu_gpu = _remap_to_gpu(
+            source, E_np, inv_eps_np, inv_mu_np,
+            mu_is_scalar, inv_mu_scalar, gpu,
+        )
+        E_updated = src_remap.update_E(
+            E=E_gpu,
+            inv_permittivities=eps_gpu,
+            inv_permeabilities=mu_gpu,
             time_step=adj,
             inverse=False,
         )
-    E_np[:] = np.asarray(E_jax)
-    del E_jax
+        E_np[:, sx, sy, sz] = np.asarray(jax.device_get(E_updated))
 
 
-def _apply_sources_H(
+def _apply_sources_H_gpu(
     H_np: np.ndarray,
     inv_eps_np: np.ndarray,
-    inv_permeabilities,
+    inv_mu_np: np.ndarray | None,
+    mu_is_scalar: bool,
+    inv_mu_scalar: float | None,
     objects: ObjectContainer,
     time_step: jax.Array,
     dtype,
+    gpu,
 ) -> None:
-    """Apply all active H-field sources to *H_np* in-place."""
-    active = [
-        s for s in objects.sources
-        if bool(jax.device_get(s.is_on_at_time_step(time_step)))
-    ]
-    if not active:
-        return
-
-    H_jax = jnp.asarray(H_np, dtype=dtype)
-    inv_eps_jax = jnp.asarray(inv_eps_np, dtype=dtype)
-    for source in active:
+    """Apply H-field sources on GPU using only the source's spatial region."""
+    for source in objects.sources:
+        if not bool(jax.device_get(source.is_on_at_time_step(time_step))):
+            continue
         adj = source.adjust_time_step_by_on_off(time_step)
-        H_jax = source.update_H(
-            H=H_jax,
-            inv_permittivities=inv_eps_jax,
-            inv_permeabilities=inv_permeabilities,
+        sx, sy, sz = source.grid_slice
+
+        src_remap, H_gpu, eps_gpu, mu_gpu = _remap_to_gpu(
+            source, H_np, inv_eps_np, inv_mu_np,
+            mu_is_scalar, inv_mu_scalar, gpu,
+        )
+        H_updated = src_remap.update_H(
+            H=H_gpu,
+            inv_permittivities=eps_gpu,
+            inv_permeabilities=mu_gpu,
             time_step=adj + 0.5,
             inverse=False,
         )
-    H_np[:] = np.asarray(H_jax)
-    del H_jax
+        H_np[:, sx, sy, sz] = np.asarray(jax.device_get(H_updated))
 
 
 # ---------------------------------------------------------------------------
-# Lightweight detector update — avoids the full-grid interpolate_fields()
-# that pads the ENTIRE E and H arrays, which would double memory usage.
-# Instead, calls each detector's .update() directly with zero-copy views.
+# GPU detector update — extract each detector's small spatial region, send
+# to GPU, remap grid_slice, and run d.update() on GPU.  Detector states
+# stay on GPU between time steps to avoid per-step transfers.
 # ---------------------------------------------------------------------------
 
-def _update_detectors_lightweight(
+def _update_detectors_gpu(
     E_np: np.ndarray,
     H_np: np.ndarray,
     inv_eps_np: np.ndarray,
-    inv_permeabilities,
+    inv_mu_np: np.ndarray | None,
+    mu_is_scalar: bool,
+    inv_mu_scalar: float | None,
     detector_states: dict,
     objects: ObjectContainer,
     time_step: jax.Array,
+    gpu,
 ) -> dict:
-    """Update detector states without allocating full-grid temporaries.
+    """Update detector states on GPU using only each detector's spatial slice.
 
-    Each detector's .update() only reads a small spatial slice of E/H,
-    so wrapping the numpy arrays as zero-copy JAX views is safe — the
-    only allocations are the small per-detector slices.
+    Each detector's region is extracted from numpy (tiny), sent to GPU,
+    and the detector's ``.update()`` runs entirely on GPU.  Detector
+    states stay resident on GPU between time steps.
     """
-    E_jax = jnp.asarray(E_np)
-    H_jax = jnp.asarray(H_np)
-    inv_eps_jax = jnp.asarray(inv_eps_np)
-
     for d in objects.forward_detectors:
         is_on = bool(jax.device_get(d._is_on_at_time_step_arr[time_step]))
         if not is_on:
             continue
-        detector_states[d.name] = d.update(
-            time_step=time_step,
-            E=E_jax,
-            H=H_jax,
-            state=detector_states[d.name],
-            inv_permittivity=inv_eps_jax,
-            inv_permeability=inv_permeabilities,
+
+        d_remap, E_gpu, eps_gpu, mu_gpu = _remap_to_gpu(
+            d, E_np, inv_eps_np, inv_mu_np,
+            mu_is_scalar, inv_mu_scalar, gpu,
+        )
+        sx, sy, sz = d.grid_slice
+        H_gpu = jax.device_put(
+            jnp.asarray(np.ascontiguousarray(H_np[:, sx, sy, sz])), gpu,
         )
 
-    del E_jax, H_jax, inv_eps_jax
+        detector_states[d.name] = d_remap.update(
+            time_step=time_step,
+            E=E_gpu,
+            H=H_gpu,
+            state=detector_states[d.name],
+            inv_permittivity=eps_gpu,
+            inv_permeability=mu_gpu,
+        )
+
     return detector_states
