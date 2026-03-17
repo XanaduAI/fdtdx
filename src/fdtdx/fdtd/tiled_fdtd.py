@@ -602,17 +602,6 @@ def tiled_fdtd(
     if not mu_is_scalar:
         _free_jax_buffer(inv_mu_val)
     del inv_mu_val
-
-    _ph = jnp.zeros((1,), dtype=config.dtype)
-    arrays = arrays.aset("E", _ph)
-    arrays = arrays.aset("H", _ph)
-    arrays = arrays.aset("inv_permittivities", _ph)
-    if has_sigma_E:
-        arrays = arrays.aset("electric_conductivity", _ph)
-    if has_sigma_H:
-        arrays = arrays.aset("magnetic_conductivity", _ph)
-    if not mu_is_scalar:
-        arrays = arrays.aset("inv_permeabilities", _ph)
     del inv_eps
     gc.collect()
 
