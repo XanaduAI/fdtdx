@@ -31,9 +31,8 @@ from fdtdx.fdtd.container import (
     ArrayContainer,
     ObjectContainer,
     SimulationState,
-    reset_array_container,
 )
-from fdtdx.fdtd.update import get_periodic_axes, update_detector_states
+from fdtdx.fdtd.update import get_periodic_axes
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +439,8 @@ def tiled_fdtd(
     Returns:
         ``(time_step, arrays)`` — same shape as ``checkpointed_fdtd``.
     """
+    import gc
+
     del key  # unused in forward-only
 
     # ------------------------------------------------------------------
@@ -454,21 +455,21 @@ def tiled_fdtd(
         )
 
     # ------------------------------------------------------------------
-    # 1. Reset fields / PML / detectors
-    # ------------------------------------------------------------------
-    arrays = reset_array_container(arrays, objects)
-
-    # ------------------------------------------------------------------
-    # 2. Device handles
+    # 1. Device handles
     # ------------------------------------------------------------------
     gpu = jax.devices("gpu")[0]
     cpu = jax.devices("cpu")[0]
+    np_dtype = np.float32 if config.dtype == jnp.float32 else np.float64
 
     # ------------------------------------------------------------------
-    # 3. Move large arrays to CPU as numpy (allows in-place slice writes)
+    # 2. Extract data from ArrayContainer into numpy / GPU arrays,
+    #    then FREE the large JAX buffers to avoid holding 2x memory.
+    #    Fields are zero (reset), so create numpy directly.
     # ------------------------------------------------------------------
-    E_np = np.array(jax.device_get(arrays.E))
-    H_np = np.array(jax.device_get(arrays.H))
+    field_shape = arrays.E.shape
+    E_np = np.zeros(field_shape, dtype=np_dtype)
+    H_np = np.zeros(field_shape, dtype=np_dtype)
+
     inv_eps_np = np.array(jax.device_get(arrays.inv_permittivities))
 
     has_sigma_E = arrays.electric_conductivity is not None
@@ -480,11 +481,13 @@ def tiled_fdtd(
     mu_is_scalar = not isinstance(inv_mu_val, jax.Array) or inv_mu_val.ndim == 0
     inv_mu_np = None if mu_is_scalar else np.array(jax.device_get(inv_mu_val))
 
-    # ------------------------------------------------------------------
-    # 4. PML arrays → GPU (small, stay resident)
-    # ------------------------------------------------------------------
-    psi_E: SparsePsi = jax.device_put(arrays.psi_E, gpu)
-    psi_H: SparsePsi = jax.device_put(arrays.psi_H, gpu)
+    # PML → GPU (small, stay resident).  Zero the psi fields (reset).
+    psi_E: SparsePsi = jax.device_put(
+        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_E), gpu,
+    )
+    psi_H: SparsePsi = jax.device_put(
+        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_H), gpu,
+    )
     alpha = tuple(jax.device_put(a, gpu) for a in arrays.alpha)
     kappa = tuple(jax.device_put(k, gpu) for k in arrays.kappa)
     sigma_pml = tuple(jax.device_put(s, gpu) for s in arrays.sigma)
@@ -495,10 +498,34 @@ def tiled_fdtd(
     kappa_y = kappa[1]   # (1, Ny, 1)
     kappa_z_full = kappa[2]  # (1, 1, Nz) — sliced per chunk
 
+    # Detector states — zero (reset), keep on CPU
+    detector_states: dict = {
+        k: {k2: jax.device_put(v2 * 0, cpu) for k2, v2 in v.items()}
+        for k, v in arrays.detector_states.items()
+    }
+    has_detectors = bool(objects.forward_detectors)
+
+    # Cache inv_permeabilities for source calls (small scalar or freed below)
+    inv_mu_for_sources = arrays.inv_permeabilities
+
+    # FREE large JAX buffers — we've copied everything we need into
+    # numpy / GPU arrays above.  This is critical to avoid 2× memory.
+    _ph = jnp.zeros((1,), dtype=config.dtype)
+    arrays = arrays.aset("E", _ph)
+    arrays = arrays.aset("H", _ph)
+    arrays = arrays.aset("inv_permittivities", _ph)
+    if has_sigma_E:
+        arrays = arrays.aset("electric_conductivity", _ph)
+    if has_sigma_H:
+        arrays = arrays.aset("magnetic_conductivity", _ph)
+    if not mu_is_scalar:
+        arrays = arrays.aset("inv_permeabilities", _ph)
+    gc.collect()
+
     # ------------------------------------------------------------------
-    # 5. Chunk configuration
+    # 3. Chunk configuration
     # ------------------------------------------------------------------
-    Nz = E_np.shape[3]
+    Nz = field_shape[3]
     Cz = chunk_size
     if Nz % Cz != 0:
         raise ValueError(
@@ -511,23 +538,15 @@ def tiled_fdtd(
     periodic_z = periodic_axes[2]
     c_num = jnp.asarray(config.courant_number, dtype=config.dtype)
 
-    # Dummy tensor for unused conductivity argument (keeps JIT shapes stable)
     _dummy_sigma = jnp.zeros((1,), dtype=config.dtype)
 
-    # Detector states are small — keep on CPU and carry forward
-    detector_states: dict = {
-        k: {k2: jax.device_put(v2, cpu) for k2, v2 in v.items()}
-        for k, v in arrays.detector_states.items()
-    }
-
     # ------------------------------------------------------------------
-    # 6. Time loop
+    # 4. Time loop
     # ------------------------------------------------------------------
     for t in range(config.time_steps_total):
         if t % 1 == 0:
             print(f"Time step {t} of {config.time_steps_total}")
         time_step = jnp.asarray(t, dtype=jnp.int32)
-        H_prev_np = H_np.copy()
 
         # ==============================================================
         # Phase 1 — E update  (reads H, writes E)
@@ -560,7 +579,7 @@ def tiled_fdtd(
 
         # --- E-field sources (on CPU, after all chunks) ---
         _apply_sources_E(
-            E_np, inv_eps_np, arrays.inv_permeabilities,
+            E_np, inv_eps_np, inv_mu_for_sources,
             objects, time_step, config.dtype,
         )
 
@@ -568,6 +587,8 @@ def tiled_fdtd(
         # Phase 2 — H update  (reads E, writes H)
         # ==============================================================
         for iz in range(n_chunks):
+            if iz % 1 == 0:
+                print(f"H update chunk {iz} of {n_chunks}")
             z0_int = iz * Cz
             z1_int = z0_int + Cz
             z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
@@ -601,41 +622,49 @@ def tiled_fdtd(
 
         # --- H-field sources (on CPU, after all chunks) ---
         _apply_sources_H(
-            H_np, inv_eps_np, arrays.inv_permeabilities,
+            H_np, inv_eps_np, inv_mu_for_sources,
             objects, time_step, config.dtype,
         )
 
         # ==============================================================
-        # Detector update (on CPU)
+        # Detector update — lightweight per-detector loop that avoids
+        # the full-grid interpolate_fields() allocation.
         # ==============================================================
-        detector_states = _update_detectors(
-            E_np, H_np, H_prev_np, inv_eps_np, arrays.inv_permeabilities,
-            detector_states, arrays, objects, time_step, periodic_axes, cpu,
-        )
+        if has_detectors:
+            detector_states = _update_detectors_lightweight(
+                E_np, H_np, inv_eps_np, inv_mu_for_sources,
+                detector_states, objects, time_step,
+            )
 
     # ------------------------------------------------------------------
-    # 7. Reconstruct output ArrayContainer
+    # 5. Reconstruct output ArrayContainer
+    #    Keep large arrays on CPU — they don't fit on GPU.
     # ------------------------------------------------------------------
-    final_E = jax.device_put(jnp.asarray(E_np), gpu)
-    final_H = jax.device_put(jnp.asarray(H_np), gpu)
-    final_det = {
-        k: {k2: jax.device_put(v2, gpu) for k2, v2 in v.items()}
-        for k, v in detector_states.items()
-    }
+    final_E = jnp.asarray(E_np)
+    final_H = jnp.asarray(H_np)
+    final_inv_eps = jnp.asarray(inv_eps_np)
 
     out = arrays
     out = out.aset("E", final_E)
     out = out.aset("H", final_H)
+    out = out.aset("inv_permittivities", final_inv_eps)
     out = out.aset("psi_E", psi_E)
     out = out.aset("psi_H", psi_H)
-    out = out.aset("detector_states", final_det)
+    out = out.aset("detector_states", detector_states)
+    if has_sigma_E:
+        out = out.aset("electric_conductivity", jnp.asarray(sigma_E_np))
+    if has_sigma_H:
+        out = out.aset("magnetic_conductivity", jnp.asarray(sigma_H_np))
+    if not mu_is_scalar:
+        out = out.aset("inv_permeabilities", jnp.asarray(inv_mu_np))
 
     final_time = jnp.asarray(config.time_steps_total, dtype=jnp.int32)
     return (final_time, out)
 
 
 # ---------------------------------------------------------------------------
-# Source helpers (execute on CPU using the existing source methods)
+# Source helpers — use jnp.asarray (zero-copy view of numpy) so the only
+# allocation is the new array from source.update_{E,H}'s .at[].set().
 # ---------------------------------------------------------------------------
 
 def _apply_sources_E(
@@ -666,6 +695,7 @@ def _apply_sources_E(
             inverse=False,
         )
     E_np[:] = np.asarray(E_jax)
+    del E_jax
 
 
 def _apply_sources_H(
@@ -696,50 +726,46 @@ def _apply_sources_H(
             inverse=False,
         )
     H_np[:] = np.asarray(H_jax)
+    del H_jax
 
 
 # ---------------------------------------------------------------------------
-# Detector helper
+# Lightweight detector update — avoids the full-grid interpolate_fields()
+# that pads the ENTIRE E and H arrays, which would double memory usage.
+# Instead, calls each detector's .update() directly with zero-copy views.
 # ---------------------------------------------------------------------------
 
-def _update_detectors(
+def _update_detectors_lightweight(
     E_np: np.ndarray,
     H_np: np.ndarray,
-    H_prev_np: np.ndarray,
     inv_eps_np: np.ndarray,
     inv_permeabilities,
     detector_states: dict,
-    arrays: ArrayContainer,
     objects: ObjectContainer,
     time_step: jax.Array,
-    periodic_axes: tuple[bool, bool, bool],
-    cpu,
 ) -> dict:
-    """Update all detector states for the current time step (on CPU).
+    """Update detector states without allocating full-grid temporaries.
 
-    Returns the updated detector_states dict.
+    Each detector's .update() only reads a small spatial slice of E/H,
+    so wrapping the numpy arrays as zero-copy JAX views is safe — the
+    only allocations are the small per-detector slices.
     """
-    if not objects.forward_detectors:
-        return detector_states
+    E_jax = jnp.asarray(E_np)
+    H_jax = jnp.asarray(H_np)
+    inv_eps_jax = jnp.asarray(inv_eps_np)
 
-    E_jax = jax.device_put(jnp.asarray(E_np), cpu)
-    H_jax = jax.device_put(jnp.asarray(H_np), cpu)
-    H_prev_jax = jax.device_put(jnp.asarray(H_prev_np), cpu)
-    inv_eps_jax = jax.device_put(jnp.asarray(inv_eps_np), cpu)
+    for d in objects.forward_detectors:
+        is_on = bool(jax.device_get(d._is_on_at_time_step_arr[time_step]))
+        if not is_on:
+            continue
+        detector_states[d.name] = d.update(
+            time_step=time_step,
+            E=E_jax,
+            H=H_jax,
+            state=detector_states[d.name],
+            inv_permittivity=inv_eps_jax,
+            inv_permeability=inv_permeabilities,
+        )
 
-    tmp = arrays
-    tmp = tmp.aset("E", E_jax)
-    tmp = tmp.aset("H", H_jax)
-    tmp = tmp.aset("inv_permittivities", inv_eps_jax)
-    tmp = tmp.aset("detector_states", detector_states)
-    if isinstance(inv_permeabilities, jax.Array):
-        tmp = tmp.aset("inv_permeabilities", jax.device_put(inv_permeabilities, cpu))
-
-    tmp = update_detector_states(
-        time_step=time_step,
-        arrays=tmp,
-        objects=objects,
-        H_prev=H_prev_jax,
-        inverse=False,
-    )
-    return tmp.detector_states
+    del E_jax, H_jax, inv_eps_jax
+    return detector_states
