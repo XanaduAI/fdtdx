@@ -119,10 +119,14 @@ def _zf_to_gpu(arr_zf: np.ndarray, gpu) -> jax.Array:
 def _gpu_to_zf(arr_gpu: jax.Array) -> np.ndarray:
     """Transfer kernel-layout GPU array to z-first numpy.
 
-    Input:  (C, Nx, Ny, Cz)  — on GPU
-    Output: (Cz, C, Nx, Ny)  — C-contiguous numpy
+    Input:  (C, Nx, Ny, Cz)  — on GPU, C-contiguous
+    Output: (Cz, C, Nx, Ny)  — numpy view (NOT contiguous)
+
+    The GPU array is copied to host as-is (fast DMA on C-contiguous data).
+    The transpose is a zero-copy numpy view; the caller's assignment to a
+    pinned z-first slice does the physical rearrangement on the CPU.
     """
-    return np.asarray(jax.device_get(jnp.transpose(arr_gpu, (3, 0, 1, 2))))
+    return np.asarray(jax.device_get(arr_gpu)).transpose(3, 0, 1, 2)
 
 
 # ---------------------------------------------------------------------------
