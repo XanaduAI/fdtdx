@@ -781,9 +781,11 @@ def tiled_fdtd(
     np_dtype = np.float32 if config.dtype == jnp.float32 else np.float64
 
     # ------------------------------------------------------------------
-    # 2. Extract data from ArrayContainer into numpy / GPU arrays,
-    #    then FREE the large JAX buffers to avoid holding 2x memory.
-    #    Fields are zero (reset), so create numpy directly.
+    # 2. Extract data from ArrayContainer into numpy / GPU arrays.
+    #    FREE each large JAX buffer IMMEDIATELY after extracting its
+    #    CPU copy so GPU HBM is reclaimed before the next extraction.
+    #    Without this, all 75+ GB of field/material arrays stay on GPU
+    #    simultaneously and OOM when PML/detector setup needs more room.
     #
     #    All large numpy arrays use Z-FIRST layout: (Nz, C, Nx, Ny).
     #    First-axis slices are C-contiguous → no strided copies needed.
@@ -792,26 +794,57 @@ def tiled_fdtd(
     field_shape = arrays.E.shape  # (3, Nx, Ny, Nz) — original layout
     _, Nx, Ny, Nz = field_shape
 
-    # Z-first field arrays: (Nz, 3, Nx, Ny)
-    E_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
-    H_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
-
-    # Material arrays: transpose from (C, Nx, Ny, Nz) → (Nz, C, Nx, Ny)
-    inv_eps_np = _to_zfirst(np.array(jax.device_get(arrays.inv_permittivities)))
-
+    # Save recording_state and detector info before freeing anything
+    _saved_recording_state = arrays.recording_state
+    has_detectors = bool(objects.forward_detectors)
     has_sigma_E = arrays.electric_conductivity is not None
     has_sigma_H = arrays.magnetic_conductivity is not None
+
+    # Fields are zero (reset) — create numpy directly, free GPU originals
+    E_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
+    H_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
+    _free_jax_buffer(arrays.E)
+    _free_jax_buffer(arrays.H)
+    gc.collect()
+    print(f"  [tiled_fdtd] Freed E+H from GPU  {_gpu_mem_info()}")
+
+    # Material arrays: extract to CPU, free GPU copy immediately
+    inv_eps_np = _to_zfirst(np.array(jax.device_get(arrays.inv_permittivities)))
+    _free_jax_buffer(arrays.inv_permittivities)
+    del inv_eps
+    gc.collect()
+    print(f"  [tiled_fdtd] Freed inv_eps from GPU  {_gpu_mem_info()}")
+
     sigma_E_np = _to_zfirst(np.array(jax.device_get(arrays.electric_conductivity))) if has_sigma_E else None
+    if has_sigma_E:
+        _free_jax_buffer(arrays.electric_conductivity)
+
     sigma_H_np = _to_zfirst(np.array(jax.device_get(arrays.magnetic_conductivity))) if has_sigma_H else None
+    if has_sigma_H:
+        _free_jax_buffer(arrays.magnetic_conductivity)
 
     inv_mu_val = arrays.inv_permeabilities
     mu_is_scalar = not isinstance(inv_mu_val, jax.Array) or inv_mu_val.ndim == 0
+    if mu_is_scalar:
+        inv_mu_scalar = float(jax.device_get(jnp.asarray(inv_mu_val)))
+    else:
+        inv_mu_scalar = None
     inv_mu_np = None if mu_is_scalar else _to_zfirst(np.array(jax.device_get(inv_mu_val)))
+    if not mu_is_scalar:
+        _free_jax_buffer(inv_mu_val)
+    del inv_mu_val
+    gc.collect()
+    print(f"  [tiled_fdtd] Freed materials from GPU  {_gpu_mem_info()}")
+
+    # Detector states — zero (reset), keep on GPU to avoid per-step transfers.
+    detector_states_gpu: dict = {}
+    for k, v in arrays.detector_states.items():
+        detector_states_gpu[k] = {}
+        for k2, v2 in v.items():
+            detector_states_gpu[k][k2] = jax.device_put(v2 * 0, gpu)
+            _free_jax_buffer(v2)
 
     # PML → GPU (small, stay resident).  Zero the psi fields (reset).
-    # Note: alpha/kappa/sigma are 1D coefficient arrays — already tiny.
-    # psi arrays are zeroed.  jax.device_put is a no-op if already on GPU,
-    # so we must NOT delete these source buffers (they'd be the same object).
     psi_E: SparsePsi = jax.device_put(
         tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_E), gpu,
     )
@@ -828,42 +861,8 @@ def tiled_fdtd(
     kappa_y = kappa[1]   # (1, Ny, 1)
     kappa_z_full = kappa[2]  # (1, 1, Nz) — sliced per chunk
 
-    has_detectors = bool(objects.forward_detectors)
-
-    # Save recording_state before deleting JAX buffers
-    _saved_recording_state = arrays.recording_state
-
-    # Capture scalar inv_permeabilities value before freeing JAX buffers.
-    if mu_is_scalar:
-        inv_mu_scalar = float(jax.device_get(jnp.asarray(inv_mu_val)))
-    else:
-        inv_mu_scalar = None
-
-    # Detector states — zero (reset), keep on GPU to avoid per-step transfers.
-    # Free original detector state buffers after zeroing and moving to GPU.
-    detector_states_gpu: dict = {}
-    for k, v in arrays.detector_states.items():
-        detector_states_gpu[k] = {}
-        for k2, v2 in v.items():
-            detector_states_gpu[k][k2] = jax.device_put(v2 * 0, gpu)
-            _free_jax_buffer(v2)
-
-    # FREE large JAX/GPU buffers.  The caller's reference to the original
-    # ArrayContainer keeps the JAX arrays alive on GPU even after we
-    # reassign our local `arrays`.  We must explicitly delete the
-    # underlying XLA buffers so GPU HBM is reclaimed immediately.
-    _free_jax_buffer(arrays.E)
-    _free_jax_buffer(arrays.H)
-    _free_jax_buffer(arrays.inv_permittivities)
-    if has_sigma_E:
-        _free_jax_buffer(arrays.electric_conductivity)
-    if has_sigma_H:
-        _free_jax_buffer(arrays.magnetic_conductivity)
-    if not mu_is_scalar:
-        _free_jax_buffer(inv_mu_val)
-    del inv_mu_val
-    del inv_eps
     gc.collect()
+    print(f"  [tiled_fdtd] PML+detectors on GPU  {_gpu_mem_info()}")
 
     # CUDA-pin the large z-first numpy arrays for fast DMA
     print("  [tiled_fdtd] Pinning host arrays...")
