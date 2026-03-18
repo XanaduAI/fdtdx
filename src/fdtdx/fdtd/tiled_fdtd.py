@@ -169,37 +169,31 @@ def _transpose_kernel_to_zf(x: jax.Array) -> jax.Array:
 
 
 _d2h_ok: bool | None = None
-_d2h_diag_count = 0
 
 
-def _gpu_to_pinned_zf(arr_gpu: jax.Array, dst_zf: np.ndarray) -> None:
+def _gpu_to_pinned_zf(
+    arr_gpu: jax.Array, dst_zf: np.ndarray, diag_label: str = "",
+) -> None:
     """Transpose on GPU then DMA directly into a pinned z-first host slice.
 
     arr_gpu : (C, Nx, Ny, Cz) on GPU — kernel layout
     dst_zf  : (Cz, C, Nx, Ny) pinned numpy — a C-contiguous slice of E_np/H_np
 
     Steps:
-      1.  cudaDeviceSynchronize — flush any pending GPU work (isolates timing)
-      2.  GPU transpose  → (Cz, C, Nx, Ny) physically C-contiguous on GPU
+      1.  GPU transpose  → (Cz, C, Nx, Ny) physically C-contiguous on GPU
+      2.  block_until_ready — waits for upstream kernel + transpose
       3.  cudaMemcpyAsync on a non-blocking stream → directly into dst_zf
-    No CPU transpose, no staging buffer.
     """
     import ctypes
     import time as _time
-    global _d2h_ok, _d2h_diag_count
-
-    rt = _get_cudart()
+    global _d2h_ok
 
     _ta = _time.perf_counter()
-    # Flush ALL pending GPU work so we can isolate the transpose + memcpy.
-    if rt is not None:
-        rt.cudaDeviceSynchronize()
-    _tb = _time.perf_counter()
-
     zf_gpu = _transpose_kernel_to_zf(arr_gpu)
     zf_gpu.block_until_ready()
-    _tc = _time.perf_counter()
+    _tb = _time.perf_counter()
 
+    rt = _get_cudart()
     stream = _get_copy_stream()
     if rt is not None and stream is not None and _d2h_ok is not False:
         try:
@@ -216,17 +210,16 @@ def _gpu_to_pinned_zf(arr_gpu: jax.Array, dst_zf: np.ndarray) -> None:
             )
             if err == 0:
                 rt.cudaStreamSynchronize(stream)
-                _td = _time.perf_counter()
+                _tc = _time.perf_counter()
                 if _d2h_ok is None:
                     print("  [tiled_fdtd] cudaMemcpyAsync D2H on non-blocking "
                           "stream — GPU transpose + pinned DMA")
                     _d2h_ok = True
-                if _d2h_diag_count < 12:
-                    _d2h_diag_count += 1
-                    print(f"    D2H diag: dev_sync={_tb-_ta:.4f}s  "
-                          f"transpose={_tc-_tb:.4f}s  "
-                          f"memcpy={_td-_tc:.4f}s  "
-                          f"total={_td-_ta:.4f}s")
+                if diag_label:
+                    print(f"    D2H {diag_label}: "
+                          f"block={_tb-_ta:.4f}s  "
+                          f"memcpy={_tc-_tb:.4f}s  "
+                          f"total={_tc-_ta:.4f}s")
                 del zf_gpu
                 return
         except Exception:
@@ -235,7 +228,14 @@ def _gpu_to_pinned_zf(arr_gpu: jax.Array, dst_zf: np.ndarray) -> None:
     if _d2h_ok is None:
         print("  [tiled_fdtd] cudaMemcpyAsync FAILED — falling back to device_get")
         _d2h_ok = False
+    _tb2 = _time.perf_counter()
     dst_zf[:] = np.asarray(jax.device_get(zf_gpu))
+    _tc2 = _time.perf_counter()
+    if diag_label:
+        print(f"    D2H {diag_label} (fallback): "
+              f"block={_tb-_ta:.4f}s  "
+              f"device_get={_tc2-_tb2:.4f}s  "
+              f"total={_tc2-_ta:.4f}s")
     del zf_gpu
 
 
@@ -916,11 +916,12 @@ def tiled_fdtd(
             del E_chunk, H_halo, eps_chunk, sig_E_chunk, kz_chunk
             _t5 = _time.perf_counter()
 
-            _gpu_to_pinned_zf(E_new, E_np[z0_int:z1_int])
+            _diag = f"E{iz}" if t < 3 and iz < 5 else ""
+            _gpu_to_pinned_zf(E_new, E_np[z0_int:z1_int], diag_label=_diag)
             del E_new
             _t6 = _time.perf_counter()
 
-            if t < 2 and iz < 3:
+            if t < 3 and iz < 5:
                 print(f"  E chunk {iz}: halo={_t1-_t0:.3f}s  E_put={_t2-_t1:.3f}s  "
                       f"eps_put={_t3-_t2:.3f}s  sig+kz={_t4-_t3:.3f}s  "
                       f"kernel={_t5-_t4:.3f}s  get+write={_t6-_t5:.3f}s  "
@@ -975,11 +976,12 @@ def tiled_fdtd(
             del H_chunk, E_halo, mu_chunk, sig_H_chunk, kz_chunk
             _t4 = _time.perf_counter()
 
-            _gpu_to_pinned_zf(H_new, H_np[z0_int:z1_int])
+            _diag = f"H{iz}" if t < 3 and iz < 5 else ""
+            _gpu_to_pinned_zf(H_new, H_np[z0_int:z1_int], diag_label=_diag)
             del H_new
             _t5 = _time.perf_counter()
 
-            if t < 2 and iz < 3:
+            if t < 3 and iz < 5:
                 print(f"  H chunk {iz}: halo={_t1-_t0:.3f}s  H_put={_t2-_t1:.3f}s  "
                       f"mu+sig+kz={_t3-_t2:.3f}s  "
                       f"kernel={_t4-_t3:.3f}s  get+write={_t5-_t4:.3f}s  "
