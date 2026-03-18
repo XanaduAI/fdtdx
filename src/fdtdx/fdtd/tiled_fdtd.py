@@ -131,38 +131,64 @@ def _get_cudart():
     return _cudart_dll
 
 
-def _gpu_to_pinned(arr_gpu: jax.Array, stage: np.ndarray) -> None:
-    """Copy a GPU array directly into a pre-allocated pinned host buffer.
+@jax.jit
+def _transpose_kernel_to_zf(x: jax.Array) -> jax.Array:
+    """GPU-side transpose: (C, Nx, Ny, Cz) → (Cz, C, Nx, Ny).
 
-    Uses cuMemcpy to bypass jax.device_get's non-pinned allocation, which
-    triggers per-page faults on GH200 (~5 μs × 270K pages ≈ 1.4 s per GB).
+    JIT ensures XLA produces a C-contiguous output in the new layout,
+    which is a physical rearrangement at full HBM bandwidth (~3 TB/s).
+    """
+    return jnp.transpose(x, (3, 0, 1, 2))
 
-    ``arr_gpu`` must be C-contiguous on GPU.
-    ``stage`` must be a pre-allocated, pinned numpy array of the same
-    shape/dtype.
+
+_cuMemcpy_ok: bool | None = None
+
+
+def _gpu_to_pinned_zf(arr_gpu: jax.Array, dst_zf: np.ndarray) -> None:
+    """Transpose on GPU then cuMemcpy directly into a pinned z-first host slice.
+
+    arr_gpu : (C, Nx, Ny, Cz) on GPU — kernel layout
+    dst_zf  : (Cz, C, Nx, Ny) pinned numpy — a C-contiguous slice of E_np/H_np
+
+    Steps:
+      1.  GPU transpose  → (Cz, C, Nx, Ny) physically C-contiguous on GPU
+      2.  cuMemcpy D→H   → directly into dst_zf (pinned, same layout)
+    No CPU transpose, no staging buffer.
     """
     import ctypes
-    arr_gpu.block_until_ready()
+    global _cuMemcpy_ok
+
+    zf_gpu = _transpose_kernel_to_zf(arr_gpu)
+    zf_gpu.block_until_ready()
+
     rt = _get_cudart()
-    if rt is None:
-        stage[:] = np.asarray(jax.device_get(arr_gpu))
-        return
-    try:
-        gpu_ptr = arr_gpu.unsafe_buffer_pointer()
-    except (AttributeError, ValueError):
+    if rt is not None and _cuMemcpy_ok is not False:
         try:
-            gpu_ptr = arr_gpu.addressable_shards[0].data.unsafe_buffer_pointer()
-        except (AttributeError, IndexError):
-            stage[:] = np.asarray(jax.device_get(arr_gpu))
-            return
-    err = rt.cudaMemcpy(
-        ctypes.c_void_p(stage.ctypes.data),
-        ctypes.c_void_p(gpu_ptr),
-        ctypes.c_size_t(stage.nbytes),
-        ctypes.c_int(2),  # cudaMemcpyDeviceToHost
-    )
-    if err != 0:
-        stage[:] = np.asarray(jax.device_get(arr_gpu))
+            try:
+                gpu_ptr = zf_gpu.unsafe_buffer_pointer()
+            except (AttributeError, ValueError):
+                gpu_ptr = zf_gpu.addressable_shards[0].data.unsafe_buffer_pointer()
+            err = rt.cudaMemcpy(
+                ctypes.c_void_p(dst_zf.ctypes.data),
+                ctypes.c_void_p(gpu_ptr),
+                ctypes.c_size_t(dst_zf.nbytes),
+                ctypes.c_int(2),  # cudaMemcpyDeviceToHost
+            )
+            if err == 0:
+                if _cuMemcpy_ok is None:
+                    print("  [tiled_fdtd] cuMemcpy D2H path active — "
+                          "GPU transpose + pinned DMA")
+                    _cuMemcpy_ok = True
+                del zf_gpu
+                return
+        except Exception:
+            pass
+
+    if _cuMemcpy_ok is None:
+        print("  [tiled_fdtd] cuMemcpy D2H FAILED — falling back to device_get")
+        _cuMemcpy_ok = False
+    dst_zf[:] = np.asarray(jax.device_get(zf_gpu))
+    del zf_gpu
 
 
 # ---------------------------------------------------------------------------
@@ -791,11 +817,6 @@ def tiled_fdtd(
 
     _dummy_sigma = jnp.zeros((1,), dtype=config.dtype)
 
-    # Pre-allocate pinned output staging buffer (kernel layout).
-    # cuMemcpy writes into this, then CPU transposes to z-first E_np/H_np.
-    _stage_out = np.zeros((3, Nx, Ny, Cz), dtype=np_dtype)
-    _cuda_pin(_stage_out)
-
     print_timestamp()
     print(f"Time loop starting")
 
@@ -844,8 +865,7 @@ def tiled_fdtd(
             )
             _t5 = _time.perf_counter()
 
-            _gpu_to_pinned(E_new, _stage_out)
-            E_np[z0_int:z1_int] = _stage_out.transpose(3, 0, 1, 2)
+            _gpu_to_pinned_zf(E_new, E_np[z0_int:z1_int])
             _t6 = _time.perf_counter()
 
             if t < 2 and iz < 3:
@@ -902,8 +922,7 @@ def tiled_fdtd(
             )
             _t4 = _time.perf_counter()
 
-            _gpu_to_pinned(H_new, _stage_out)
-            H_np[z0_int:z1_int] = _stage_out.transpose(3, 0, 1, 2)
+            _gpu_to_pinned_zf(H_new, H_np[z0_int:z1_int])
             _t5 = _time.perf_counter()
 
             if t < 2 and iz < 3:
