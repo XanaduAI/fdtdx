@@ -179,21 +179,27 @@ def _gpu_to_pinned_zf(arr_gpu: jax.Array, dst_zf: np.ndarray) -> None:
     dst_zf  : (Cz, C, Nx, Ny) pinned numpy — a C-contiguous slice of E_np/H_np
 
     Steps:
-      1.  GPU transpose  → (Cz, C, Nx, Ny) physically C-contiguous on GPU
-      2.  cudaMemcpyAsync on a non-blocking stream → directly into dst_zf
-      3.  cudaStreamSynchronize on that stream only
-    No CPU transpose, no staging buffer, no default-stream stalls.
+      1.  cudaDeviceSynchronize — flush any pending GPU work (isolates timing)
+      2.  GPU transpose  → (Cz, C, Nx, Ny) physically C-contiguous on GPU
+      3.  cudaMemcpyAsync on a non-blocking stream → directly into dst_zf
+    No CPU transpose, no staging buffer.
     """
     import ctypes
     import time as _time
     global _d2h_ok, _d2h_diag_count
 
+    rt = _get_cudart()
+
     _ta = _time.perf_counter()
-    zf_gpu = _transpose_kernel_to_zf(arr_gpu)
-    zf_gpu.block_until_ready()
+    # Flush ALL pending GPU work so we can isolate the transpose + memcpy.
+    if rt is not None:
+        rt.cudaDeviceSynchronize()
     _tb = _time.perf_counter()
 
-    rt = _get_cudart()
+    zf_gpu = _transpose_kernel_to_zf(arr_gpu)
+    zf_gpu.block_until_ready()
+    _tc = _time.perf_counter()
+
     stream = _get_copy_stream()
     if rt is not None and stream is not None and _d2h_ok is not False:
         try:
@@ -210,15 +216,17 @@ def _gpu_to_pinned_zf(arr_gpu: jax.Array, dst_zf: np.ndarray) -> None:
             )
             if err == 0:
                 rt.cudaStreamSynchronize(stream)
-                _tc = _time.perf_counter()
+                _td = _time.perf_counter()
                 if _d2h_ok is None:
                     print("  [tiled_fdtd] cudaMemcpyAsync D2H on non-blocking "
                           "stream — GPU transpose + pinned DMA")
                     _d2h_ok = True
-                if _d2h_diag_count < 6:
+                if _d2h_diag_count < 12:
                     _d2h_diag_count += 1
-                    print(f"    D2H diag: transpose+sync={_tb-_ta:.4f}s  "
-                          f"memcpy={_tc-_tb:.4f}s  total={_tc-_ta:.4f}s")
+                    print(f"    D2H diag: dev_sync={_tb-_ta:.4f}s  "
+                          f"transpose={_tc-_tb:.4f}s  "
+                          f"memcpy={_td-_tc:.4f}s  "
+                          f"total={_td-_ta:.4f}s")
                 del zf_gpu
                 return
         except Exception:
@@ -443,7 +451,8 @@ _CURL_SIGN = (+1.0, -1.0, +1.0, -1.0, +1.0, -1.0)
 # JIT-compiled per-chunk E update
 # ---------------------------------------------------------------------------
 
-@partial(jax.jit, static_argnames=("Cz", "Nz", "periodic_axes", "has_conductivity"))
+@partial(jax.jit, static_argnames=("Cz", "Nz", "periodic_axes", "has_conductivity"),
+         donate_argnums=(0, 1, 2, 4))
 def _update_E_chunk(
     E_chunk: jax.Array,
     H_halo: jax.Array,
@@ -529,7 +538,8 @@ def _update_E_chunk(
 # JIT-compiled per-chunk H update
 # ---------------------------------------------------------------------------
 
-@partial(jax.jit, static_argnames=("Cz", "Nz", "periodic_axes", "has_conductivity", "mu_is_scalar"))
+@partial(jax.jit, static_argnames=("Cz", "Nz", "periodic_axes", "has_conductivity", "mu_is_scalar"),
+         donate_argnums=(0, 1, 4))
 def _update_H_chunk(
     H_chunk: jax.Array,
     E_halo: jax.Array,
@@ -903,9 +913,11 @@ def tiled_fdtd(
                 periodic_axes=periodic_axes,
                 has_conductivity=has_sigma_E,
             )
+            del E_chunk, H_halo, eps_chunk, sig_E_chunk, kz_chunk
             _t5 = _time.perf_counter()
 
             _gpu_to_pinned_zf(E_new, E_np[z0_int:z1_int])
+            del E_new
             _t6 = _time.perf_counter()
 
             if t < 2 and iz < 3:
@@ -960,9 +972,11 @@ def tiled_fdtd(
                 has_conductivity=has_sigma_H,
                 mu_is_scalar=mu_is_scalar,
             )
+            del H_chunk, E_halo, mu_chunk, sig_H_chunk, kz_chunk
             _t4 = _time.perf_counter()
 
             _gpu_to_pinned_zf(H_new, H_np[z0_int:z1_int])
+            del H_new
             _t5 = _time.perf_counter()
 
             if t < 2 and iz < 3:
