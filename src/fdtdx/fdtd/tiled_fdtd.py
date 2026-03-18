@@ -141,10 +141,30 @@ def _get_cudart():
             rt.cudaMemcpyAsync.restype = ctypes.c_int
             rt.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
             rt.cudaStreamSynchronize.restype = ctypes.c_int
+            rt.cudaDeviceSynchronize.argtypes = []
+            rt.cudaDeviceSynchronize.restype = ctypes.c_int
+            rt.cudaMemGetInfo.argtypes = [
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t)]
+            rt.cudaMemGetInfo.restype = ctypes.c_int
             _cudart_dll = rt
         except OSError:
             pass
     return _cudart_dll
+
+
+def _gpu_mem_info() -> str:
+    """Return a string like '42.1/96.0 GB free' or '' on failure."""
+    import ctypes
+    rt = _get_cudart()
+    if rt is None:
+        return ""
+    free = ctypes.c_size_t()
+    total = ctypes.c_size_t()
+    err = rt.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+    if err != 0:
+        return ""
+    return f"{free.value / (1024**3):.1f}/{total.value / (1024**3):.1f} GB free"
 
 
 @jax.jit
@@ -913,7 +933,10 @@ def tiled_fdtd(
         # Phase 1 — E update  (reads H, writes E)
         # ==============================================================
         print_timestamp()
-        print(f"E update starting")
+        if t < 5:
+            print(f"E update starting  gpu_mem={_gpu_mem_info()}")
+        else:
+            print(f"E update starting")
         import time as _time
         _chunk_times_E = []
         for iz in range(n_chunks):
@@ -982,19 +1005,25 @@ def tiled_fdtd(
         _tgc0 = _time.perf_counter()
         _gc.collect()
         _tgc1 = _time.perf_counter()
-        # Force a GPU round-trip to drain any pending XLA/CUDA work.
+        # Force full CUDA device sync to drain ALL streams (not just XLA compute).
         _tsync0 = _time.perf_counter()
-        jax.device_put(jnp.zeros(1, dtype=config.dtype), gpu).block_until_ready()
+        _rt = _get_cudart()
+        if _rt:
+            _rt.cudaDeviceSynchronize()
         _tsync1 = _time.perf_counter()
         if t < 5:
             print(f"  gc between E-src → H: {_tgc1 - _tgc0:.3f}s  "
-                  f"gpu_sync={_tsync1 - _tsync0:.3f}s")
+                  f"device_sync={_tsync1 - _tsync0:.3f}s  "
+                  f"gpu_mem={_gpu_mem_info()}")
 
         # ==============================================================
         # Phase 2 — H update  (reads E, writes H)
         # ==============================================================
         print_timestamp()
-        print(f"H update starting")
+        if t < 5:
+            print(f"H update starting  gpu_mem={_gpu_mem_info()}")
+        else:
+            print(f"H update starting")
         _chunk_times_H = []
         for iz in range(n_chunks):
             z0_int = iz * Cz
@@ -1079,11 +1108,13 @@ def tiled_fdtd(
         _gc.collect()
         _tgc1 = _time.perf_counter()
         _tsync0 = _time.perf_counter()
-        jax.device_put(jnp.zeros(1, dtype=config.dtype), gpu).block_until_ready()
+        if _rt:
+            _rt.cudaDeviceSynchronize()
         _tsync1 = _time.perf_counter()
         if t < 5:
             print(f"  gc between det → next E: {_tgc1 - _tgc0:.3f}s  "
-                  f"gpu_sync={_tsync1 - _tsync0:.3f}s")
+                  f"device_sync={_tsync1 - _tsync0:.3f}s  "
+                  f"gpu_mem={_gpu_mem_info()}")
 
     # ------------------------------------------------------------------
     # 5. Reconstruct output ArrayContainer
