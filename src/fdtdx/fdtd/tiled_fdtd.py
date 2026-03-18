@@ -116,17 +116,53 @@ def _zf_to_gpu(arr_zf: np.ndarray, gpu) -> jax.Array:
     return jnp.transpose(jax.device_put(arr_zf, gpu), (1, 2, 3, 0))
 
 
-def _gpu_to_zf(arr_gpu: jax.Array) -> np.ndarray:
-    """Transfer kernel-layout GPU array to z-first numpy.
+_cudart_dll: "ctypes.CDLL | None" = None  # type: ignore[name-defined]
+_cudart_tried = False
 
-    Input:  (C, Nx, Ny, Cz)  — on GPU, C-contiguous
-    Output: (Cz, C, Nx, Ny)  — numpy view (NOT contiguous)
+def _get_cudart():
+    global _cudart_dll, _cudart_tried
+    if not _cudart_tried:
+        _cudart_tried = True
+        import ctypes
+        try:
+            _cudart_dll = ctypes.CDLL('libcudart.so')
+        except OSError:
+            pass
+    return _cudart_dll
 
-    The GPU array is copied to host as-is (fast DMA on C-contiguous data).
-    The transpose is a zero-copy numpy view; the caller's assignment to a
-    pinned z-first slice does the physical rearrangement on the CPU.
+
+def _gpu_to_pinned(arr_gpu: jax.Array, stage: np.ndarray) -> None:
+    """Copy a GPU array directly into a pre-allocated pinned host buffer.
+
+    Uses cuMemcpy to bypass jax.device_get's non-pinned allocation, which
+    triggers per-page faults on GH200 (~5 μs × 270K pages ≈ 1.4 s per GB).
+
+    ``arr_gpu`` must be C-contiguous on GPU.
+    ``stage`` must be a pre-allocated, pinned numpy array of the same
+    shape/dtype.
     """
-    return np.asarray(jax.device_get(arr_gpu)).transpose(3, 0, 1, 2)
+    import ctypes
+    arr_gpu.block_until_ready()
+    rt = _get_cudart()
+    if rt is None:
+        stage[:] = np.asarray(jax.device_get(arr_gpu))
+        return
+    try:
+        gpu_ptr = arr_gpu.unsafe_buffer_pointer()
+    except (AttributeError, ValueError):
+        try:
+            gpu_ptr = arr_gpu.addressable_shards[0].data.unsafe_buffer_pointer()
+        except (AttributeError, IndexError):
+            stage[:] = np.asarray(jax.device_get(arr_gpu))
+            return
+    err = rt.cudaMemcpy(
+        ctypes.c_void_p(stage.ctypes.data),
+        ctypes.c_void_p(gpu_ptr),
+        ctypes.c_size_t(stage.nbytes),
+        ctypes.c_int(2),  # cudaMemcpyDeviceToHost
+    )
+    if err != 0:
+        stage[:] = np.asarray(jax.device_get(arr_gpu))
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +791,11 @@ def tiled_fdtd(
 
     _dummy_sigma = jnp.zeros((1,), dtype=config.dtype)
 
+    # Pre-allocate pinned output staging buffer (kernel layout).
+    # cuMemcpy writes into this, then CPU transposes to z-first E_np/H_np.
+    _stage_out = np.zeros((3, Nx, Ny, Cz), dtype=np_dtype)
+    _cuda_pin(_stage_out)
+
     print_timestamp()
     print(f"Time loop starting")
 
@@ -803,7 +844,8 @@ def tiled_fdtd(
             )
             _t5 = _time.perf_counter()
 
-            E_np[z0_int:z1_int] = _gpu_to_zf(E_new)
+            _gpu_to_pinned(E_new, _stage_out)
+            E_np[z0_int:z1_int] = _stage_out.transpose(3, 0, 1, 2)
             _t6 = _time.perf_counter()
 
             if t < 2 and iz < 3:
@@ -860,7 +902,8 @@ def tiled_fdtd(
             )
             _t4 = _time.perf_counter()
 
-            H_np[z0_int:z1_int] = _gpu_to_zf(H_new)
+            _gpu_to_pinned(H_new, _stage_out)
+            H_np[z0_int:z1_int] = _stage_out.transpose(3, 0, 1, 2)
             _t5 = _time.perf_counter()
 
             if t < 2 and iz < 3:
