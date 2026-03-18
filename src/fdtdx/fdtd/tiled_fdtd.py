@@ -118,8 +118,14 @@ def _zf_to_gpu(arr_zf: np.ndarray, gpu) -> jax.Array:
 
     Input:  (Cz, C, Nx, Ny)  — C-contiguous first-axis slice of pinned memory
     Output: (C, Nx, Ny, Cz)  — on GPU, ready for the kernel
+
+    With unified memory, the device_put buffer may land in LPDDR5X.
+    We prefetch it into HBM before the transpose so the GPU reads at
+    full HBM bandwidth (~3 TB/s) instead of demand-paging from LPDDR5X.
     """
-    return jnp.transpose(jax.device_put(arr_zf, gpu), (1, 2, 3, 0))
+    gpu_buf = jax.device_put(arr_zf, gpu)
+    _prefetch_to_hbm(gpu_buf)
+    return jnp.transpose(gpu_buf, (1, 2, 3, 0))
 
 
 _cudart_dll: "ctypes.CDLL | None" = None  # type: ignore[name-defined]
@@ -147,6 +153,10 @@ def _get_cudart():
                 ctypes.POINTER(ctypes.c_size_t),
                 ctypes.POINTER(ctypes.c_size_t)]
             rt.cudaMemGetInfo.restype = ctypes.c_int
+            rt.cudaMemPrefetchAsync.argtypes = [
+                ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.c_int, ctypes.c_void_p]
+            rt.cudaMemPrefetchAsync.restype = ctypes.c_int
             _cudart_dll = rt
         except OSError:
             pass
@@ -165,6 +175,38 @@ def _gpu_mem_info() -> str:
     if err != 0:
         return ""
     return f"{free.value / (1024**3):.1f}/{total.value / (1024**3):.1f} GB free"
+
+
+def _prefetch_to_hbm(arr: jax.Array) -> None:
+    """Prefetch a JAX GPU array's pages into HBM using bulk DMA.
+
+    With TF_FORCE_UNIFIED_MEMORY=1, XLA allocations use cudaMallocManaged.
+    New pages may reside in LPDDR5X.  GPU demand-paging migrates them one
+    4 KB page at a time (~4 μs each), totalling ~26 s for 25 GB.
+    cudaMemPrefetchAsync uses bulk NVLink-C2C DMA (~900 GB/s), moving the
+    same 25 GB in ~28 ms — a 1000× improvement.
+
+    Uses the per-thread default stream (0x2) which is non-blocking: it does
+    not implicitly serialize with XLA's compute stream, so there is no risk
+    of reintroducing the legacy-default-stream stalls we fixed earlier.
+    """
+    import ctypes
+    rt = _get_cudart()
+    if rt is None:
+        return
+    try:
+        try:
+            ptr = arr.unsafe_buffer_pointer()
+        except (AttributeError, ValueError):
+            ptr = arr.addressable_shards[0].data.unsafe_buffer_pointer()
+        rt.cudaMemPrefetchAsync(
+            ctypes.c_void_p(ptr),
+            ctypes.c_size_t(arr.nbytes),
+            ctypes.c_int(0),     # device 0
+            ctypes.c_void_p(2),  # cudaStreamPerThread — non-blocking
+        )
+    except Exception:
+        pass
 
 
 @jax.jit
@@ -199,6 +241,9 @@ def _gpu_to_pinned_zf(
     global _d2h_ok, _STREAM_PER_THREAD
 
     _ta = _time.perf_counter()
+    # Prefetch kernel output pages into HBM before the transpose reads them.
+    # Without this, unified memory demand-paging can stall ~29s on 25 GB.
+    _prefetch_to_hbm(arr_gpu)
     zf_gpu = _transpose_kernel_to_zf(arr_gpu)
     zf_gpu.block_until_ready()
     _tb = _time.perf_counter()
@@ -862,7 +907,22 @@ def tiled_fdtd(
     kappa_z_full = kappa[2]  # (1, 1, Nz) — sliced per chunk
 
     gc.collect()
-    print(f"  [tiled_fdtd] PML+detectors on GPU  {_gpu_mem_info()}")
+
+    # Prefetch PML arrays into HBM so they never trigger page faults.
+    for _psi_pair in psi_E + psi_H:
+        for _p in _psi_pair:
+            _prefetch_to_hbm(_p)
+    for _coeff_tuple in (b_pml, a_pml):
+        for _c in _coeff_tuple:
+            _prefetch_to_hbm(_c)
+    _prefetch_to_hbm(kappa_x)
+    _prefetch_to_hbm(kappa_y)
+    _prefetch_to_hbm(kappa_z_full)
+    _rt_init = _get_cudart()
+    if _rt_init:
+        import ctypes as _ct
+        _rt_init.cudaStreamSynchronize(_ct.c_void_p(2))
+    print(f"  [tiled_fdtd] PML+detectors prefetched to HBM  {_gpu_mem_info()}")
 
     # CUDA-pin the large z-first numpy arrays for fast DMA
     print("  [tiled_fdtd] Pinning host arrays...")
