@@ -982,8 +982,13 @@ def tiled_fdtd(
         _tgc0 = _time.perf_counter()
         _gc.collect()
         _tgc1 = _time.perf_counter()
+        # Force a GPU round-trip to drain any pending XLA/CUDA work.
+        _tsync0 = _time.perf_counter()
+        jax.device_put(jnp.zeros(1, dtype=config.dtype), gpu).block_until_ready()
+        _tsync1 = _time.perf_counter()
         if t < 5:
-            print(f"  gc between E-src → H: {_tgc1 - _tgc0:.3f}s")
+            print(f"  gc between E-src → H: {_tgc1 - _tgc0:.3f}s  "
+                  f"gpu_sync={_tsync1 - _tsync0:.3f}s")
 
         # ==============================================================
         # Phase 2 — H update  (reads E, writes H)
@@ -1073,8 +1078,12 @@ def tiled_fdtd(
         _tgc0 = _time.perf_counter()
         _gc.collect()
         _tgc1 = _time.perf_counter()
+        _tsync0 = _time.perf_counter()
+        jax.device_put(jnp.zeros(1, dtype=config.dtype), gpu).block_until_ready()
+        _tsync1 = _time.perf_counter()
         if t < 5:
-            print(f"  gc between det → next E: {_tgc1 - _tgc0:.3f}s")
+            print(f"  gc between det → next E: {_tgc1 - _tgc0:.3f}s  "
+                  f"gpu_sync={_tsync1 - _tsync0:.3f}s")
 
     # ------------------------------------------------------------------
     # 5. Reconstruct output ArrayContainer
