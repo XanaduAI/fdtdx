@@ -135,10 +135,12 @@ def _get_cudart():
             rt.cudaHostRegister.argtypes = [
                 ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
             rt.cudaHostRegister.restype = ctypes.c_int
-            rt.cudaMemcpy.argtypes = [
+            rt.cudaMemcpyAsync.argtypes = [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-                ctypes.c_int]
-            rt.cudaMemcpy.restype = ctypes.c_int
+                ctypes.c_int, ctypes.c_void_p]
+            rt.cudaMemcpyAsync.restype = ctypes.c_int
+            rt.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+            rt.cudaStreamSynchronize.restype = ctypes.c_int
             _cudart_dll = rt
         except OSError:
             pass
@@ -156,6 +158,7 @@ def _transpose_kernel_to_zf(x: jax.Array) -> jax.Array:
 
 
 _d2h_ok: bool | None = None
+_STREAM_PER_THREAD = None  # lazily set to ctypes.c_void_p(2)
 
 
 def _gpu_to_pinned_zf(
@@ -166,14 +169,14 @@ def _gpu_to_pinned_zf(
     arr_gpu : (C, Nx, Ny, Cz) on GPU — kernel layout
     dst_zf  : (Cz, C, Nx, Ny) pinned numpy — a C-contiguous slice of E_np/H_np
 
-    Steps:
-      1.  GPU transpose  → (Cz, C, Nx, Ny) physically C-contiguous on GPU
-      2.  block_until_ready — waits for upstream kernel + transpose
-      3.  cudaMemcpy (synchronous, default stream) → directly into dst_zf
+    Uses cudaMemcpyAsync on the per-thread default stream (0x2) to avoid
+    the legacy default stream's implicit synchronisation with all other
+    CUDA streams, which was causing 20-30s stalls by blocking XLA's
+    compute stream.
     """
     import ctypes
     import time as _time
-    global _d2h_ok
+    global _d2h_ok, _STREAM_PER_THREAD
 
     _ta = _time.perf_counter()
     zf_gpu = _transpose_kernel_to_zf(arr_gpu)
@@ -183,21 +186,25 @@ def _gpu_to_pinned_zf(
     rt = _get_cudart()
     if rt is not None and _d2h_ok is not False:
         try:
+            if _STREAM_PER_THREAD is None:
+                _STREAM_PER_THREAD = ctypes.c_void_p(2)  # cudaStreamPerThread
             try:
                 gpu_ptr = zf_gpu.unsafe_buffer_pointer()
             except (AttributeError, ValueError):
                 gpu_ptr = zf_gpu.addressable_shards[0].data.unsafe_buffer_pointer()
-            err = rt.cudaMemcpy(
+            err = rt.cudaMemcpyAsync(
                 ctypes.c_void_p(dst_zf.ctypes.data),
                 ctypes.c_void_p(gpu_ptr),
                 ctypes.c_size_t(dst_zf.nbytes),
                 ctypes.c_int(2),  # cudaMemcpyDeviceToHost
+                _STREAM_PER_THREAD,
             )
             if err == 0:
+                sync_err = rt.cudaStreamSynchronize(_STREAM_PER_THREAD)
                 _tc = _time.perf_counter()
                 if _d2h_ok is None:
-                    print("  [tiled_fdtd] cudaMemcpy D2H — "
-                          "GPU transpose + synchronous DMA to pinned host")
+                    print("  [tiled_fdtd] cudaMemcpyAsync D2H on per-thread stream — "
+                          "GPU transpose + async DMA to pinned host")
                     _d2h_ok = True
                 if diag_label:
                     elapsed_memcpy = _tc - _tb
@@ -212,7 +219,7 @@ def _gpu_to_pinned_zf(
             pass
 
     if _d2h_ok is None:
-        print("  [tiled_fdtd] cudaMemcpy FAILED — falling back to device_get")
+        print("  [tiled_fdtd] cudaMemcpyAsync FAILED — falling back to device_get")
         _d2h_ok = False
     _tb2 = _time.perf_counter()
     dst_zf[:] = np.asarray(jax.device_get(zf_gpu))
@@ -242,11 +249,37 @@ def _pad_xy(field: jax.Array, periodic_axes: tuple[bool, bool, bool]) -> jax.Arr
     return field
 
 
+_edge_halo_E: np.ndarray | None = None  # pinned buffer for E-update edge halo
+_edge_halo_H: np.ndarray | None = None  # pinned buffer for H-update edge halo
+
+
+def _get_edge_halo_buf(field_np: np.ndarray, Cz: int, tag: str) -> np.ndarray:
+    """Return a pre-allocated, CUDA-pinned buffer for edge halos.
+
+    Shape: (Cz+1, C, Nx, Ny).  Pinned so that device_put uses fast DMA
+    instead of faulting every 4 KB page (~5 µs each → 5 s for 1 GB).
+    """
+    global _edge_halo_E, _edge_halo_H
+    buf = _edge_halo_E if tag == "E" else _edge_halo_H
+    need = (Cz + 1,) + field_np.shape[1:]
+    if buf is None or buf.shape != need or buf.dtype != field_np.dtype:
+        buf = np.empty(need, dtype=field_np.dtype)
+        ok = _cuda_pin(buf, f"edge_halo_{tag}")
+        if not ok:
+            print(f"  [edge_halo] WARNING: could not pin {tag} halo buffer")
+        if tag == "E":
+            _edge_halo_E = buf
+        else:
+            _edge_halo_H = buf
+    return buf
+
+
 def _build_H_halo_for_E(
     H_np: np.ndarray,
     z0: int,
     z1: int,
     Nz: int,
+    Cz: int,
     periodic_z: bool,
     gpu,
 ) -> jax.Array:
@@ -256,11 +289,15 @@ def _build_H_halo_for_E(
     Returns GPU array in kernel layout: (3, Nx, Ny, Cz+1).
     """
     if z0 > 0:
-        halo_zf = H_np[z0 - 1 : z1]  # contiguous first-axis slice
+        halo_zf = H_np[z0 - 1 : z1]  # contiguous first-axis slice of pinned mem
     else:
-        chunk = H_np[0:z1]
-        left = H_np[-1:] if periodic_z else np.zeros_like(chunk[:1])
-        halo_zf = np.concatenate([left, chunk], axis=0)
+        buf = _get_edge_halo_buf(H_np, Cz, "E")
+        if periodic_z:
+            buf[0] = H_np[-1]
+        else:
+            buf[0] = 0
+        buf[1:] = H_np[0:z1]
+        halo_zf = buf
     return _zf_to_gpu(halo_zf, gpu)
 
 
@@ -269,6 +306,7 @@ def _build_E_halo_for_H(
     z0: int,
     z1: int,
     Nz: int,
+    Cz: int,
     periodic_z: bool,
     gpu,
 ) -> jax.Array:
@@ -280,9 +318,13 @@ def _build_E_halo_for_H(
     if z1 < Nz:
         halo_zf = E_np[z0 : z1 + 1]  # contiguous first-axis slice
     else:
-        chunk = E_np[z0:z1]
-        right = E_np[:1] if periodic_z else np.zeros_like(chunk[:1])
-        halo_zf = np.concatenate([chunk, right], axis=0)
+        buf = _get_edge_halo_buf(E_np, Cz, "H")
+        buf[:-1] = E_np[z0:z1]
+        if periodic_z:
+            buf[-1] = E_np[0]
+        else:
+            buf[-1] = 0
+        halo_zf = buf
     return _zf_to_gpu(halo_zf, gpu)
 
 
@@ -880,7 +922,7 @@ def tiled_fdtd(
             z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
 
             _t0 = _time.perf_counter()
-            H_halo = _build_H_halo_for_E(H_np, z0_int, z1_int, Nz, periodic_z, gpu)
+            H_halo = _build_H_halo_for_E(H_np, z0_int, z1_int, Nz, Cz, periodic_z, gpu)
             _t1 = _time.perf_counter()
             E_chunk = _zf_to_gpu(E_np[z0_int:z1_int], gpu)
             _t2 = _time.perf_counter()
@@ -955,7 +997,7 @@ def tiled_fdtd(
             z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
 
             _t0 = _time.perf_counter()
-            E_halo = _build_E_halo_for_H(E_np, z0_int, z1_int, Nz, periodic_z, gpu)
+            E_halo = _build_E_halo_for_H(E_np, z0_int, z1_int, Nz, Cz, periodic_z, gpu)
             _t1 = _time.perf_counter()
             H_chunk = _zf_to_gpu(H_np[z0_int:z1_int], gpu)
             _t2 = _time.perf_counter()
