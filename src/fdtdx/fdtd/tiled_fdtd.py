@@ -125,7 +125,23 @@ def _get_cudart():
         _cudart_tried = True
         import ctypes
         try:
-            _cudart_dll = ctypes.CDLL('libcudart.so')
+            rt = ctypes.CDLL('libcudart.so')
+            # Set argtypes/restype for every CUDA call to prevent ctypes
+            # from truncating 64-bit pointers or mis-converting arguments.
+            rt.cudaHostRegister.argtypes = [
+                ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+            rt.cudaHostRegister.restype = ctypes.c_int
+            rt.cudaStreamCreateWithFlags.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+            rt.cudaStreamCreateWithFlags.restype = ctypes.c_int
+            rt.cudaMemcpyAsync.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.c_int, ctypes.c_void_p]
+            rt.cudaMemcpyAsync.restype = ctypes.c_int
+            rt.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+            rt.cudaStreamSynchronize.restype = ctypes.c_int
+            rt.cudaDeviceSynchronize.restype = ctypes.c_int
+            _cudart_dll = rt
         except OSError:
             pass
     return _cudart_dll
@@ -155,6 +171,8 @@ def _get_copy_stream():
             )
             if err == 0:
                 _copy_stream = s
+                print(f"  [tiled_fdtd] Non-blocking CUDA stream created: "
+                      f"handle=0x{s.value:x}")
     return _copy_stream
 
 
@@ -201,25 +219,28 @@ def _gpu_to_pinned_zf(
                 gpu_ptr = zf_gpu.unsafe_buffer_pointer()
             except (AttributeError, ValueError):
                 gpu_ptr = zf_gpu.addressable_shards[0].data.unsafe_buffer_pointer()
-            err = rt.cudaMemcpyAsync(
+            cpy_err = rt.cudaMemcpyAsync(
                 ctypes.c_void_p(dst_zf.ctypes.data),
                 ctypes.c_void_p(gpu_ptr),
                 ctypes.c_size_t(dst_zf.nbytes),
                 ctypes.c_int(2),  # cudaMemcpyDeviceToHost
                 stream,
             )
-            if err == 0:
-                rt.cudaStreamSynchronize(stream)
+            if cpy_err == 0:
+                sync_err = rt.cudaStreamSynchronize(stream)
                 _tc = _time.perf_counter()
                 if _d2h_ok is None:
                     print("  [tiled_fdtd] cudaMemcpyAsync D2H on non-blocking "
                           "stream — GPU transpose + pinned DMA")
                     _d2h_ok = True
                 if diag_label:
+                    elapsed_memcpy = _tc - _tb
+                    flag = " *** STALL ***" if elapsed_memcpy > 0.5 else ""
                     print(f"    D2H {diag_label}: "
                           f"block={_tb-_ta:.4f}s  "
-                          f"memcpy={_tc-_tb:.4f}s  "
-                          f"total={_tc-_ta:.4f}s")
+                          f"memcpy={elapsed_memcpy:.4f}s  "
+                          f"sync_err={sync_err}  "
+                          f"total={_tc-_ta:.4f}s{flag}")
                 del zf_gpu
                 return
         except Exception:
