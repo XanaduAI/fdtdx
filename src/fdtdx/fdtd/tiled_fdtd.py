@@ -915,6 +915,14 @@ def tiled_fdtd(
             objects, time_step, config.dtype, gpu,
         )
 
+        # Flush deferred XLA buffer frees so the H chunk loop starts clean.
+        import gc as _gc
+        _tgc0 = _time.perf_counter()
+        _gc.collect()
+        _tgc1 = _time.perf_counter()
+        if t < 3:
+            print(f"  gc between E-src → H: {_tgc1 - _tgc0:.3f}s")
+
         # ==============================================================
         # Phase 2 — H update  (reads E, writes H)
         # ==============================================================
@@ -986,6 +994,13 @@ def tiled_fdtd(
                 mu_is_scalar, inv_mu_scalar,
                 detector_states_gpu, objects, time_step, gpu,
             )
+
+        # Flush deferred XLA buffer frees before next time step's E update.
+        _tgc0 = _time.perf_counter()
+        _gc.collect()
+        _tgc1 = _time.perf_counter()
+        if t < 3:
+            print(f"  gc between det → next E: {_tgc1 - _tgc0:.3f}s")
 
     # ------------------------------------------------------------------
     # 5. Reconstruct output ArrayContainer
