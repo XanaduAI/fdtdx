@@ -79,7 +79,7 @@ def _pin_memory_to_cpu():
         pass
 
 
-def _cuda_pin(arr: np.ndarray) -> bool:
+def _cuda_pin(arr: np.ndarray, label: str = "") -> bool:
     """Pin a C-contiguous numpy array as CUDA page-locked host memory.
 
     On GH200, this pre-registers pages in the GPU's page table so that
@@ -88,18 +88,24 @@ def _cuda_pin(arr: np.ndarray) -> bool:
     Returns True on success.
     """
     if not arr.flags['C_CONTIGUOUS']:
+        print(f"  [cuda_pin] SKIP {label}: not C-contiguous")
         return False
-    try:
-        import ctypes
-        rt = ctypes.CDLL('libcudart.so')
-        err = rt.cudaHostRegister(
-            ctypes.c_void_p(arr.ctypes.data),
-            ctypes.c_size_t(arr.nbytes),
-            ctypes.c_uint(1),  # cudaHostRegisterPortable
-        )
-        return err == 0
-    except (OSError, Exception):
+    rt = _get_cudart()
+    if rt is None:
+        print(f"  [cuda_pin] SKIP {label}: no cudart")
         return False
+    import ctypes
+    err = rt.cudaHostRegister(
+        ctypes.c_void_p(arr.ctypes.data),
+        ctypes.c_size_t(arr.nbytes),
+        ctypes.c_uint(1),  # cudaHostRegisterPortable
+    )
+    gb = arr.nbytes / (1024**3)
+    if err == 0:
+        print(f"  [cuda_pin] OK {label}: {gb:.2f} GB pinned")
+    else:
+        print(f"  [cuda_pin] FAIL {label}: {gb:.2f} GB, cuda error {err}")
+    return err == 0
 
 
 def _to_zfirst(arr: np.ndarray) -> np.ndarray:
@@ -798,14 +804,16 @@ def tiled_fdtd(
     gc.collect()
 
     # CUDA-pin the large z-first numpy arrays for fast DMA
-    for _arr in [E_np, H_np, inv_eps_np]:
-        _cuda_pin(_arr)
+    print("  [tiled_fdtd] Pinning host arrays...")
+    _cuda_pin(E_np, "E_np")
+    _cuda_pin(H_np, "H_np")
+    _cuda_pin(inv_eps_np, "inv_eps_np")
     if sigma_E_np is not None:
-        _cuda_pin(sigma_E_np)
+        _cuda_pin(sigma_E_np, "sigma_E_np")
     if sigma_H_np is not None:
-        _cuda_pin(sigma_H_np)
+        _cuda_pin(sigma_H_np, "sigma_H_np")
     if inv_mu_np is not None:
-        _cuda_pin(inv_mu_np)
+        _cuda_pin(inv_mu_np, "inv_mu_np")
 
     # ------------------------------------------------------------------
     # 3. Chunk configuration
@@ -865,6 +873,7 @@ def tiled_fdtd(
         print_timestamp()
         print(f"E update starting")
         import time as _time
+        _chunk_times_E = []
         for iz in range(n_chunks):
             z0_int = iz * Cz
             z1_int = z0_int + Cz
@@ -896,16 +905,27 @@ def tiled_fdtd(
             del E_chunk, H_halo, eps_chunk, sig_E_chunk, kz_chunk
             _t5 = _time.perf_counter()
 
-            _diag = f"E{iz}" if t < 3 and iz < 5 else ""
+            _diag = f"E{iz}" if t < 5 and (iz < 5 or iz % 5 == 0) else ""
             _gpu_to_pinned_zf(E_new, E_np[z0_int:z1_int], diag_label=_diag)
             del E_new
             _t6 = _time.perf_counter()
+            _chunk_times_E.append(_t6 - _t0)
 
-            if t < 3 and iz < 5:
+            _chunk_total = _t6 - _t0
+            if t < 5 and (iz < 5 or _chunk_total > 1.0):
                 print(f"  E chunk {iz}: halo={_t1-_t0:.3f}s  E_put={_t2-_t1:.3f}s  "
                       f"eps_put={_t3-_t2:.3f}s  sig+kz={_t4-_t3:.3f}s  "
                       f"kernel={_t5-_t4:.3f}s  get+write={_t6-_t5:.3f}s  "
-                      f"total={_t6-_t0:.3f}s")
+                      f"total={_chunk_total:.3f}s"
+                      + (" *** SLOW ***" if _chunk_total > 1.0 and iz >= 5 else ""))
+        if t < 5:
+            _ct = _chunk_times_E
+            _slow = [(i, c) for i, c in enumerate(_ct) if c > 0.5]
+            print(f"  E summary: total={sum(_ct):.1f}s  "
+                  f"min={min(_ct):.3f}s  max={max(_ct):.1f}s  "
+                  f"avg={sum(_ct)/len(_ct):.3f}s  "
+                  f"stalls(>0.5s)={len(_slow)}"
+                  + (f"  worst={_slow[:3]}" if _slow else ""))
 
         # --- E-field sources (on GPU, small region only) ---
         print_timestamp()
@@ -920,7 +940,7 @@ def tiled_fdtd(
         _tgc0 = _time.perf_counter()
         _gc.collect()
         _tgc1 = _time.perf_counter()
-        if t < 3:
+        if t < 5:
             print(f"  gc between E-src → H: {_tgc1 - _tgc0:.3f}s")
 
         # ==============================================================
@@ -928,6 +948,7 @@ def tiled_fdtd(
         # ==============================================================
         print_timestamp()
         print(f"H update starting")
+        _chunk_times_H = []
         for iz in range(n_chunks):
             z0_int = iz * Cz
             z1_int = z0_int + Cz
@@ -964,16 +985,27 @@ def tiled_fdtd(
             del H_chunk, E_halo, mu_chunk, sig_H_chunk, kz_chunk
             _t4 = _time.perf_counter()
 
-            _diag = f"H{iz}" if t < 3 and iz < 5 else ""
+            _diag = f"H{iz}" if t < 5 and (iz < 5 or iz % 5 == 0) else ""
             _gpu_to_pinned_zf(H_new, H_np[z0_int:z1_int], diag_label=_diag)
             del H_new
             _t5 = _time.perf_counter()
+            _chunk_times_H.append(_t5 - _t0)
 
-            if t < 3 and iz < 5:
+            _chunk_total = _t5 - _t0
+            if t < 5 and (iz < 5 or _chunk_total > 1.0):
                 print(f"  H chunk {iz}: halo={_t1-_t0:.3f}s  H_put={_t2-_t1:.3f}s  "
                       f"mu+sig+kz={_t3-_t2:.3f}s  "
                       f"kernel={_t4-_t3:.3f}s  get+write={_t5-_t4:.3f}s  "
-                      f"total={_t5-_t0:.3f}s")
+                      f"total={_chunk_total:.3f}s"
+                      + (" *** SLOW ***" if _chunk_total > 1.0 and iz >= 5 else ""))
+        if t < 5:
+            _ct = _chunk_times_H
+            _slow = [(i, c) for i, c in enumerate(_ct) if c > 0.5]
+            print(f"  H summary: total={sum(_ct):.1f}s  "
+                  f"min={min(_ct):.3f}s  max={max(_ct):.1f}s  "
+                  f"avg={sum(_ct)/len(_ct):.3f}s  "
+                  f"stalls(>0.5s)={len(_slow)}"
+                  + (f"  worst={_slow[:3]}" if _slow else ""))
 
         # --- H-field sources (on GPU, small region only) ---
         print_timestamp()
@@ -999,7 +1031,7 @@ def tiled_fdtd(
         _tgc0 = _time.perf_counter()
         _gc.collect()
         _tgc1 = _time.perf_counter()
-        if t < 3:
+        if t < 5:
             print(f"  gc between det → next E: {_tgc1 - _tgc0:.3f}s")
 
     # ------------------------------------------------------------------
