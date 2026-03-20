@@ -1,16 +1,15 @@
 """Tiled FDTD for CPU-GPU streaming on unified memory systems (e.g. GH200).
 
 All large arrays (E, H, material properties) are kept in CPU memory. Z-axis
-chunks are streamed to GPU for computation, then results are streamed back.
-PML auxiliary fields and coefficients stay permanently on GPU.
-
-This avoids the page-fault thrashing that occurs when CUDA unified memory
-demand-pages individual 4-64 KB pages across the NVLink interconnect. Instead,
-each chunk triggers a single bulk DMA transfer at full NVLink bandwidth.
+chunks are streamed directly to the GPU in their native z-first (Cz, C, Nx, Ny) 
+layout. The JIT kernels operate natively on this layout, ensuring perfect 
+buffer donation and avoiding XLA reallocation page faults.
 """
 
 from functools import partial
 import datetime
+import gc
+import ctypes
 
 import jax
 import jax.lax as lax
@@ -27,6 +26,7 @@ from fdtdx.core.physics.curl import (
     _compute_pml_ab,
     _extract_pml_slab,
     _scatter_psi_component,
+    _update_sparse_psi,
 )
 from fdtdx.fdtd.container import (
     ArrayContainer,
@@ -35,589 +35,224 @@ from fdtdx.fdtd.container import (
 )
 from fdtdx.fdtd.update import get_periodic_axes
 
-def print_timestamp():
-    print(f"Timestamp: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}")
+
+def _print_timestamp():
+    print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
-# ---------------------------------------------------------------------------
-# Memory placement helpers for GH200
-# ---------------------------------------------------------------------------
-
-def _free_jax_buffer(arr) -> None:
-    """Explicitly free a JAX array's underlying XLA buffer.
-
-    On GH200, the caller's reference to the input ArrayContainer keeps
-    large JAX arrays alive on GPU even after tiled_fdtd copies them to
-    numpy.  This function invalidates the buffer so GPU HBM is reclaimed
-    immediately.  Any subsequent access to the array will raise an error.
-    """
-    if not isinstance(arr, jax.Array):
-        return
-    try:
-        arr.delete()
-    except Exception:
-        pass
-
-
-def _pin_memory_to_cpu():
-    """On GH200 in NUMA mode, GPU HBM is exposed as a NUMA node and the OS
-    can migrate malloc'd pages to HBM.  Call this early to bind all
-    subsequent allocations to the CPU's LPDDR5X NUMA node.
-
-    This is a no-op if libnuma is unavailable or the system has only one
-    NUMA node (non-GH200).
-    """
-    import ctypes
-    import ctypes.util
-    try:
-        lib = ctypes.CDLL(ctypes.util.find_library("numa"))
-        n_nodes = lib.numa_max_node() + 1
-        if n_nodes <= 1:
-            return
-        lib.numa_set_preferred(0)
-    except (OSError, TypeError):
-        pass
-
-
-def _cuda_pin(arr: np.ndarray, label: str = "") -> bool:
-    """Pin a C-contiguous numpy array as CUDA page-locked host memory.
-
-    On GH200, this pre-registers pages in the GPU's page table so that
-    ``jax.device_put`` can DMA directly at full NVLink-C2C bandwidth
-    instead of faulting every 4 KB page (~5 μs each).
-    Returns True on success.
-    """
-    if not arr.flags['C_CONTIGUOUS']:
-        print(f"  [cuda_pin] SKIP {label}: not C-contiguous")
-        return False
-    rt = _get_cudart()
-    if rt is None:
-        print(f"  [cuda_pin] SKIP {label}: no cudart")
-        return False
-    import ctypes
-    err = rt.cudaHostRegister(
-        ctypes.c_void_p(arr.ctypes.data),
-        ctypes.c_size_t(arr.nbytes),
-        ctypes.c_uint(1),  # cudaHostRegisterPortable
-    )
-    gb = arr.nbytes / (1024**3)
-    if err == 0:
-        print(f"  [cuda_pin] OK {label}: {gb:.2f} GB pinned")
-    else:
-        print(f"  [cuda_pin] FAIL {label}: {gb:.2f} GB, cuda error {err}")
-    return err == 0
-
-
-def _to_zfirst(arr: np.ndarray) -> np.ndarray:
-    """Transpose (C, Nx, Ny, Nz) → (Nz, C, Nx, Ny) and return C-contiguous."""
-    return np.ascontiguousarray(np.transpose(arr, (3, 0, 1, 2)))
-
-
-def _zf_to_gpu(arr_zf: np.ndarray, gpu) -> jax.Array:
-    """Transfer a z-first numpy slice to GPU and transpose to kernel layout.
-
-    Input:  (Cz, C, Nx, Ny)  — C-contiguous first-axis slice of pinned memory
-    Output: (C, Nx, Ny, Cz)  — on GPU, ready for the kernel
-
-    With unified memory, the device_put buffer may land in LPDDR5X.
-    We prefetch it into HBM before the transpose so the GPU reads at
-    full HBM bandwidth (~3 TB/s) instead of demand-paging from LPDDR5X.
-    """
-    gpu_buf = jax.device_put(arr_zf, gpu)
-    _prefetch_to_hbm(gpu_buf)
-    return jnp.transpose(gpu_buf, (1, 2, 3, 0))
-
-
-_cudart_dll: "ctypes.CDLL | None" = None  # type: ignore[name-defined]
-_cudart_tried = False
-
-def _get_cudart():
-    global _cudart_dll, _cudart_tried
-    if not _cudart_tried:
-        _cudart_tried = True
-        import ctypes
+# --- Setup CUDA Runtime via ctypes ---
+def _load_cudart():
+    for lib in ['libcudart.so', 'libcudart.so.12', 'libcudart.so.11.0']:
         try:
-            rt = ctypes.CDLL('libcudart.so')
-            rt.cudaHostRegister.argtypes = [
-                ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-            rt.cudaHostRegister.restype = ctypes.c_int
-            rt.cudaMemcpyAsync.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-                ctypes.c_int, ctypes.c_void_p]
-            rt.cudaMemcpyAsync.restype = ctypes.c_int
-            rt.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
-            rt.cudaStreamSynchronize.restype = ctypes.c_int
-            rt.cudaDeviceSynchronize.argtypes = []
-            rt.cudaDeviceSynchronize.restype = ctypes.c_int
-            rt.cudaMemGetInfo.argtypes = [
-                ctypes.POINTER(ctypes.c_size_t),
-                ctypes.POINTER(ctypes.c_size_t)]
-            rt.cudaMemGetInfo.restype = ctypes.c_int
-            rt.cudaMemPrefetchAsync.argtypes = [
-                ctypes.c_void_p, ctypes.c_size_t,
-                ctypes.c_int, ctypes.c_void_p]
-            rt.cudaMemPrefetchAsync.restype = ctypes.c_int
-            _cudart_dll = rt
+            return ctypes.CDLL(lib)
         except OSError:
             pass
-    return _cudart_dll
+    raise OSError("Could not find libcudart.so. Ensure CUDA is installed.")
 
 
-def _gpu_mem_info() -> str:
-    """Return a string like '42.1/96.0 GB free' or '' on failure."""
-    import ctypes
-    rt = _get_cudart()
-    if rt is None:
-        return ""
-    free = ctypes.c_size_t()
-    total = ctypes.c_size_t()
-    err = rt.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+cudart = _load_cudart()
+cudart.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+cudart.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+cudart.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+CUDA_HOST_REGISTER_DEFAULT = 0
+CUDA_MEMCPY_HOST_TO_DEVICE = 1
+CUDA_MEMCPY_DEVICE_TO_HOST = 2
+
+
+def _check_cuda(err, func):
     if err != 0:
-        return ""
-    return f"{free.value / (1024**3):.1f}/{total.value / (1024**3):.1f} GB free"
+        raise RuntimeError(f"CUDA Error {err} in {func}")
 
 
-def _prefetch_to_hbm(arr: jax.Array) -> None:
-    """Prefetch a JAX GPU array's pages into HBM using bulk DMA.
-
-    With TF_FORCE_UNIFIED_MEMORY=1, XLA allocations use cudaMallocManaged.
-    New pages may reside in LPDDR5X.  GPU demand-paging migrates them one
-    4 KB page at a time (~4 μs each), totalling ~26 s for 25 GB.
-    cudaMemPrefetchAsync uses bulk NVLink-C2C DMA (~900 GB/s), moving the
-    same 25 GB in ~28 ms — a 1000× improvement.
-
-    Uses the per-thread default stream (0x2) which is non-blocking: it does
-    not implicitly serialize with XLA's compute stream, so there is no risk
-    of reintroducing the legacy-default-stream stalls we fixed earlier.
-    """
-    import ctypes
-    rt = _get_cudart()
-    if rt is None:
-        return
-    try:
-        try:
-            ptr = arr.unsafe_buffer_pointer()
-        except (AttributeError, ValueError):
-            ptr = arr.addressable_shards[0].data.unsafe_buffer_pointer()
-        rt.cudaMemPrefetchAsync(
-            ctypes.c_void_p(ptr),
-            ctypes.c_size_t(arr.nbytes),
-            ctypes.c_int(0),     # device 0
-            ctypes.c_void_p(2),  # cudaStreamPerThread — non-blocking
-        )
-    except Exception:
-        pass
+def _memcpy_gpu_to_cpu(gpu_arr: jax.Array, cpu_arr: np.ndarray) -> None:
+    _check_cuda(
+        cudart.cudaMemcpy(cpu_arr.ctypes.data, gpu_arr.unsafe_buffer_pointer(), gpu_arr.nbytes, CUDA_MEMCPY_DEVICE_TO_HOST),
+        "cudaMemcpy (D2H)"
+    )
 
 
-@jax.jit
-def _transpose_kernel_to_zf(x: jax.Array) -> jax.Array:
-    """GPU-side transpose: (C, Nx, Ny, Cz) → (Cz, C, Nx, Ny).
-
-    JIT ensures XLA produces a C-contiguous output in the new layout,
-    which is a physical rearrangement at full HBM bandwidth (~3 TB/s).
-    """
-    return jnp.transpose(x, (3, 0, 1, 2))
+def _memcpy_cpu_to_gpu(cpu_arr: np.ndarray, gpu_arr: jax.Array) -> None:
+    _check_cuda(
+        cudart.cudaMemcpy(gpu_arr.unsafe_buffer_pointer(), cpu_arr.ctypes.data, cpu_arr.nbytes, CUDA_MEMCPY_HOST_TO_DEVICE),
+        "cudaMemcpy (H2D)"
+    )
 
 
-_d2h_ok: bool | None = None
-_STREAM_PER_THREAD = None  # lazily set to ctypes.c_void_p(2)
+def _register_cpu_memory(cpu_arr: np.ndarray) -> None:
+    _check_cuda(
+        cudart.cudaHostRegister(cpu_arr.ctypes.data, cpu_arr.nbytes, CUDA_HOST_REGISTER_DEFAULT),
+        "cudaHostRegister (cpu_arr)"
+    )
 
 
-def _gpu_to_pinned_zf(
-    arr_gpu: jax.Array, dst_zf: np.ndarray, diag_label: str = "",
-) -> None:
-    """Transpose on GPU then copy directly into a pinned z-first host slice.
-
-    arr_gpu : (C, Nx, Ny, Cz) on GPU — kernel layout
-    dst_zf  : (Cz, C, Nx, Ny) pinned numpy — a C-contiguous slice of E_np/H_np
-
-    Uses cudaMemcpyAsync on the per-thread default stream (0x2) to avoid
-    the legacy default stream's implicit synchronisation with all other
-    CUDA streams, which was causing 20-30s stalls by blocking XLA's
-    compute stream.
-    """
-    import ctypes
-    import time as _time
-    global _d2h_ok, _STREAM_PER_THREAD
-
-    _ta = _time.perf_counter()
-    # Prefetch kernel output pages into HBM before the transpose reads them.
-    # Without this, unified memory demand-paging can stall ~29s on 25 GB.
-    _prefetch_to_hbm(arr_gpu)
-    zf_gpu = _transpose_kernel_to_zf(arr_gpu)
-    zf_gpu.block_until_ready()
-    _tb = _time.perf_counter()
-
-    rt = _get_cudart()
-    if rt is not None and _d2h_ok is not False:
-        try:
-            if _STREAM_PER_THREAD is None:
-                _STREAM_PER_THREAD = ctypes.c_void_p(2)  # cudaStreamPerThread
-            try:
-                gpu_ptr = zf_gpu.unsafe_buffer_pointer()
-            except (AttributeError, ValueError):
-                gpu_ptr = zf_gpu.addressable_shards[0].data.unsafe_buffer_pointer()
-            err = rt.cudaMemcpyAsync(
-                ctypes.c_void_p(dst_zf.ctypes.data),
-                ctypes.c_void_p(gpu_ptr),
-                ctypes.c_size_t(dst_zf.nbytes),
-                ctypes.c_int(2),  # cudaMemcpyDeviceToHost
-                _STREAM_PER_THREAD,
-            )
-            if err == 0:
-                sync_err = rt.cudaStreamSynchronize(_STREAM_PER_THREAD)
-                _tc = _time.perf_counter()
-                if _d2h_ok is None:
-                    print("  [tiled_fdtd] cudaMemcpyAsync D2H on per-thread stream — "
-                          "GPU transpose + async DMA to pinned host")
-                    _d2h_ok = True
-                if diag_label:
-                    elapsed_memcpy = _tc - _tb
-                    flag = " *** STALL ***" if elapsed_memcpy > 0.5 else ""
-                    print(f"    D2H {diag_label}: "
-                          f"block={_tb-_ta:.4f}s  "
-                          f"memcpy={elapsed_memcpy:.4f}s  "
-                          f"total={_tc-_ta:.4f}s{flag}")
-                del zf_gpu
-                return
-        except Exception:
-            pass
-
-    if _d2h_ok is None:
-        print("  [tiled_fdtd] cudaMemcpyAsync FAILED — falling back to device_get")
-        _d2h_ok = False
-    _tb2 = _time.perf_counter()
-    dst_zf[:] = np.asarray(jax.device_get(zf_gpu))
-    _tc2 = _time.perf_counter()
-    if diag_label:
-        print(f"    D2H {diag_label} (fallback): "
-              f"block={_tb-_ta:.4f}s  "
-              f"device_get={_tc2-_tb2:.4f}s  "
-              f"total={_tc2-_ta:.4f}s")
-    del zf_gpu
+def _unregister_cpu_memory(cpu_arr: np.ndarray) -> None:
+    _check_cuda(
+        cudart.cudaHostUnregister(cpu_arr.ctypes.data),
+        "cudaHostUnregister (cpu_arr)"
+    )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _memcpy_to_cpu_and_transpose(gpu_arr: jax.Array, Nx: int, Ny: int, Nz: int) -> np.ndarray:
+    # 1. Allocate the final shape natively in pinned CPU memory.
+    cpu_arr = np.empty((Nx, Ny, Nz, 3), dtype=np.float32)
+    _register_cpu_memory(cpu_arr)
 
-def _pad_xy(field: jax.Array, periodic_axes: tuple[bool, bool, bool]) -> jax.Array:
-    """Pad along x (axis 1) and y (axis 2) with +1 on each side.
+    # 2. Process the transpose on the GPU in safe, bite-sized chunks to prevent OOM
+    chunk_size = 1  
+    for i in range(0, Nx, chunk_size):
+        end_i = min(i + chunk_size, Nx)
+        
+        # --- STEP A: Slice on GPU ---
+        # Shape: (3, chunk_size, Ny, Nz)
+        gpu_slice = gpu_arr[:, i:end_i, :, :]
+        
+        # --- STEP B: Transpose on GPU ---
+        # JAX transpose is also just a view. We MUST force a physical copy 
+        # on the GPU so the memory becomes physically contiguous for the DMA transfer.
+        gpu_slice_T = jnp.transpose(gpu_slice, (1, 2, 3, 0))
+        gpu_slice_T_contiguous = jnp.copy(gpu_slice_T)
+        gpu_slice_T_contiguous.block_until_ready()
+        
+        # --- STEP C: DMA Transfer to Pinned CPU Memory ---
+        src_ptr = gpu_slice_T_contiguous.unsafe_buffer_pointer()
+        
+        # Because cpu_arr is contiguous on axis 0, slicing it gives us the 
+        # exact, contiguous byte offset we need for the destination pointer!
+        dst_slice = cpu_arr[i:end_i, :, :, :]
+        dst_ptr = dst_slice.ctypes.data
+        size = dst_slice.nbytes
+        
+        _memcpy_gpu_to_cpu(gpu_slice_T_contiguous, dst_slice)
+        
+        # --- STEP D: Free transient GPU memory for the next loop ---
+        del gpu_slice, gpu_slice_T, gpu_slice_T_contiguous
+        
+    return cpu_arr
 
-    Z (axis 3) is NOT padded — the caller handles z-halos explicitly.
-    """
-    for i in range(2):
+
+def _pad_yz(field, periodic_axes):
+    # Field layout is (Cx+1, Ny, Nz, 3). Pad axes 1 (y) and 2 (z).
+    for i in (1, 2):
         mode = "wrap" if periodic_axes[i] else "constant"
         pw = [(0, 0)] * 4
-        pw[i + 1] = (1, 1)
+        pw[i] = (1, 1)
         field = jnp.pad(field, pw, mode=mode)
     return field
 
-
-_edge_halo_E: np.ndarray | None = None  # pinned buffer for E-update edge halo
-_edge_halo_H: np.ndarray | None = None  # pinned buffer for H-update edge halo
-
-
-def _get_edge_halo_buf(field_np: np.ndarray, Cz: int, tag: str) -> np.ndarray:
-    """Return a pre-allocated, CUDA-pinned buffer for edge halos.
-
-    Shape: (Cz+1, C, Nx, Ny).  Pinned so that device_put uses fast DMA
-    instead of faulting every 4 KB page (~5 µs each → 5 s for 1 GB).
-    """
-    global _edge_halo_E, _edge_halo_H
-    buf = _edge_halo_E if tag == "E" else _edge_halo_H
-    need = (Cz + 1,) + field_np.shape[1:]
-    if buf is None or buf.shape != need or buf.dtype != field_np.dtype:
-        buf = np.empty(need, dtype=field_np.dtype)
-        ok = _cuda_pin(buf, f"edge_halo_{tag}")
-        if not ok:
-            print(f"  [edge_halo] WARNING: could not pin {tag} halo buffer")
-        if tag == "E":
-            _edge_halo_E = buf
-        else:
-            _edge_halo_H = buf
-    return buf
-
-
-def _build_H_halo_for_E(
-    H_np: np.ndarray,
-    z0: int,
-    z1: int,
-    Nz: int,
-    Cz: int,
-    periodic_z: bool,
-    gpu,
-) -> jax.Array:
-    """H chunk with 1-cell LEFT z-halo.
-
-    H_np is z-first: (Nz, 3, Nx, Ny).
-    Returns GPU array in kernel layout: (3, Nx, Ny, Cz+1).
-    """
-    if z0 > 0:
-        halo_zf = H_np[z0 - 1 : z1]  # contiguous first-axis slice of pinned mem
-    else:
-        buf = _get_edge_halo_buf(H_np, Cz, "E")
-        if periodic_z:
-            buf[0] = H_np[-1]
-        else:
-            buf[0] = 0
-        buf[1:] = H_np[0:z1]
-        halo_zf = buf
-    return _zf_to_gpu(halo_zf, gpu)
-
-
-def _build_E_halo_for_H(
-    E_np: np.ndarray,
-    z0: int,
-    z1: int,
-    Nz: int,
-    Cz: int,
-    periodic_z: bool,
-    gpu,
-) -> jax.Array:
-    """E chunk with 1-cell RIGHT z-halo.
-
-    E_np is z-first: (Nz, 3, Nx, Ny).
-    Returns GPU array in kernel layout: (3, Nx, Ny, Cz+1).
-    """
-    if z1 < Nz:
-        halo_zf = E_np[z0 : z1 + 1]  # contiguous first-axis slice
-    else:
-        buf = _get_edge_halo_buf(E_np, Cz, "H")
-        buf[:-1] = E_np[z0:z1]
-        if periodic_z:
-            buf[-1] = E_np[0]
-        else:
-            buf[-1] = 0
-        halo_zf = buf
-    return _zf_to_gpu(halo_zf, gpu)
-
-
-# ---------------------------------------------------------------------------
-# PML chunk helpers (called inside JIT)
-# ---------------------------------------------------------------------------
-
-def _pml_update_xy(
-    psi_min: jax.Array,
-    psi_max: jax.Array,
-    d_field: jax.Array,
-    b_coeff: jax.Array,
-    a_coeff: jax.Array,
-    axis: int,
-    z0: jax.Array,
-    Cz: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Update an x-axis or y-axis PML psi component for one z-chunk.
-
-    Psi slabs for axes 0 and 1 have full Nz extent so they must be
-    z-sliced with ``dynamic_slice`` / ``dynamic_update_slice``.
-
-    Returns (updated_psi_min, updated_psi_max, psi_min_chunk, psi_max_chunk).
-    The chunk arrays are what gets scattered into the curl.
-    """
-    L_min = psi_min.shape[axis]
-    L_max = psi_max.shape[axis]
-
-    z_dim = 2  # z is always the last spatial dim of the psi slab
-
-    def _z_slice(arr: jax.Array) -> jax.Array:
-        starts = [jnp.int32(0)] * 3
-        starts[z_dim] = z0
-        sizes = list(arr.shape)
-        sizes[z_dim] = Cz
-        return lax.dynamic_slice(arr, starts, sizes)
-
-    def _z_write(arr: jax.Array, update: jax.Array) -> jax.Array:
-        starts = [jnp.int32(0)] * 3
-        starts[z_dim] = z0
-        return lax.dynamic_update_slice(arr, update, starts)
-
-    psi_min_c = _z_slice(psi_min)
-    psi_max_c = _z_slice(psi_max)
-
-    if L_min > 0:
-        d_min = _extract_pml_slab(d_field, axis, L_min, "min")
-        b_min = _extract_pml_slab(b_coeff, axis, L_min, "min")
-        a_min = _extract_pml_slab(a_coeff, axis, L_min, "min")
-        psi_min_c = b_min * psi_min_c + a_min * d_min
-        psi_min = _z_write(psi_min, psi_min_c)
-
-    if L_max > 0:
-        d_max = _extract_pml_slab(d_field, axis, L_max, "max")
-        b_max = _extract_pml_slab(b_coeff, axis, L_max, "max")
-        a_max = _extract_pml_slab(a_coeff, axis, L_max, "max")
-        psi_max_c = b_max * psi_max_c + a_max * d_max
-        psi_max = _z_write(psi_max, psi_max_c)
-
-    return psi_min, psi_max, psi_min_c, psi_max_c
-
-
-def _pml_update_z(
-    psi_min: jax.Array,
-    psi_max: jax.Array,
-    d_field: jax.Array,
-    b_coeff: jax.Array,
-    a_coeff: jax.Array,
-    z0: jax.Array,
-    Cz: int,
-    Nz: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Update a z-axis PML psi component for the current chunk.
-
-    Uses gather-and-mask so the PML thickness and chunk size are independent.
-    Each chunk updates only the portion of the psi slab that overlaps its
-    z-range; non-overlapping entries are left unchanged.
-    """
-    L_min = psi_min.shape[2]
-    L_max = psi_max.shape[2]
-
-    if L_min > 0:
-        b_min = _extract_pml_slab(b_coeff, 2, L_min, "min")
-        a_min = _extract_pml_slab(a_coeff, 2, L_min, "min")
-        # psi_min index p ↔ global z = p.  Overlap when z0 <= p < z0+Cz.
-        psi_idx = jnp.arange(L_min)
-        in_chunk = (psi_idx >= z0) & (psi_idx < z0 + Cz)
-        chunk_local = jnp.clip(psi_idx - z0, 0, Cz - 1)
-        d_gathered = d_field[:, :, chunk_local]  # (Nx, Ny, L_min)
-        psi_min_new = b_min * psi_min + a_min * d_gathered
-        psi_min = jnp.where(in_chunk[None, None, :], psi_min_new, psi_min)
-
-    if L_max > 0:
-        b_max = _extract_pml_slab(b_coeff, 2, L_max, "max")
-        a_max = _extract_pml_slab(a_coeff, 2, L_max, "max")
-        # psi_max index p ↔ global z = Nz - L_max + p.
-        psi_global = Nz - L_max + jnp.arange(L_max)
-        in_chunk = (psi_global >= z0) & (psi_global < z0 + Cz)
-        chunk_local = jnp.clip(psi_global - z0, 0, Cz - 1)
-        d_gathered = d_field[:, :, chunk_local]
-        psi_max_new = b_max * psi_max + a_max * d_gathered
-        psi_max = jnp.where(in_chunk[None, None, :], psi_max_new, psi_max)
-
-    return psi_min, psi_max
-
-
-def _scatter_z_psi(
-    curl_comp: jax.Array,
-    psi_min: jax.Array,
-    psi_max: jax.Array,
-    sign: float,
-    z0: jax.Array,
-    Cz: int,
-    Nz: int,
-) -> jax.Array:
-    """Scatter z-axis PML psi into curl for the current chunk.
-
-    Each chunk-local z position that falls inside a PML region picks up
-    the corresponding psi value.  No constraint on PML thickness vs Cz.
-    """
-    L_min = psi_min.shape[2]
-    L_max = psi_max.shape[2]
-    local_z = jnp.arange(Cz)
-    global_z = local_z + z0
-
-    if L_min > 0:
-        in_pml_min = global_z < L_min
-        safe_idx = jnp.clip(global_z, 0, L_min - 1)
-        psi_vals = psi_min[:, :, safe_idx]  # (Nx, Ny, Cz)
-        curl_comp = curl_comp + jnp.where(
-            in_pml_min[None, None, :], sign * psi_vals, 0.0,
-        )
-
-    if L_max > 0:
-        pml_max_start = Nz - L_max
-        in_pml_max = global_z >= pml_max_start
-        safe_idx = jnp.clip(global_z - pml_max_start, 0, L_max - 1)
-        psi_vals = psi_max[:, :, safe_idx]
-        curl_comp = curl_comp + jnp.where(
-            in_pml_max[None, None, :], sign * psi_vals, 0.0,
-        )
-
-    return curl_comp
-
-
-# Scatter mapping: component index → (curl vector index, sign)
 _CURL_IDX = (0, 0, 1, 1, 2, 2)
 _CURL_SIGN = (+1.0, -1.0, +1.0, -1.0, +1.0, -1.0)
 
 
-# ---------------------------------------------------------------------------
-# JIT-compiled per-chunk E update
-# ---------------------------------------------------------------------------
+def _pml_update_x_xf(psi_min, psi_max, d_field, b_coeff, a_coeff, x0_int, Cx, Nx):
+    """Update psi for axis 0 (x, the chunked axis)."""
+    L_min, L_max = psi_min.shape[0], psi_max.shape[0]
+    x1_int = x0_int + Cx
 
-@partial(jax.jit, static_argnames=("Cz", "Nz", "periodic_axes", "has_conductivity"),
-         donate_argnums=(0, 1, 2, 4))
+    if L_min > 0:
+        b_min = _extract_pml_slab(b_coeff, 0, L_min, "min")
+        a_min = _extract_pml_slab(a_coeff, 0, L_min, "min")
+        psi_idx = jnp.arange(L_min)
+        in_chunk = (psi_idx >= x0_int) & (psi_idx < x1_int)
+        chunk_local = jnp.clip(psi_idx - x0_int, 0, Cx - 1)
+        d_gathered = d_field[chunk_local, :, :]
+        psi_min_new = b_min * psi_min + a_min * d_gathered
+        psi_min = jnp.where(in_chunk[:, None, None], psi_min_new, psi_min)
+
+    if L_max > 0:
+        b_max = _extract_pml_slab(b_coeff, 0, L_max, "max")
+        a_max = _extract_pml_slab(a_coeff, 0, L_max, "max")
+        psi_global = Nx - L_max + jnp.arange(L_max)
+        in_chunk = (psi_global >= x0_int) & (psi_global < x1_int)
+        chunk_local = jnp.clip(psi_global - x0_int, 0, Cx - 1)
+        d_gathered = d_field[chunk_local, :, :]
+        psi_max_new = b_max * psi_max + a_max * d_gathered
+        psi_max = jnp.where(in_chunk[:, None, None], psi_max_new, psi_max)
+
+    return psi_min, psi_max
+
+
+def _scatter_x_psi_xf(curl_comp, psi_min, psi_max, sign, x0_int, Cx, Nx):
+    """Scatter x-axis psi into chunk curl component."""
+    L_min, L_max = psi_min.shape[0], psi_max.shape[0]
+    local_x = jnp.arange(Cx)
+    global_x = local_x + x0_int
+
+    if L_min > 0:
+        in_pml_min = global_x < L_min
+        safe_idx = jnp.clip(global_x, 0, L_min - 1)
+        curl_comp = curl_comp + jnp.where(in_pml_min[:, None, None], sign * psi_min[safe_idx, :, :], 0.0)
+
+    if L_max > 0:
+        pml_max_start = Nx - L_max
+        in_pml_max = global_x >= pml_max_start
+        safe_idx = jnp.clip(global_x - pml_max_start, 0, L_max - 1)
+        curl_comp = curl_comp + jnp.where(in_pml_max[:, None, None], sign * psi_max[safe_idx, :, :], 0.0)
+
+    return curl_comp
+
+
+@partial(
+    jax.jit, 
+    donate_argnames=("E_chunk", "psi_E"),
+    static_argnames=("Cx", "Nx", "periodic_axes", "courant_number"), 
+)
 def _update_E_chunk(
-    E_chunk: jax.Array,
-    H_halo: jax.Array,
-    inv_eps_chunk: jax.Array,
-    sigma_E_chunk: jax.Array,
-    psi_E: SparsePsi,
-    b_pml: tuple[jax.Array, ...],
-    a_pml: tuple[jax.Array, ...],
-    kappa_x: jax.Array,
-    kappa_y: jax.Array,
-    kappa_z_chunk: jax.Array,
-    z0: jax.Array,
-    courant_number: jax.Array,
-    Nz: int,
-    Cz: int,
-    periodic_axes: tuple[bool, bool, bool],
-    has_conductivity: bool,
-) -> tuple[jax.Array, SparsePsi]:
-    """Compute one z-chunk of the E-field update (curl_H → PML → material)."""
+    E_chunk,
+    H_halo,
+    inv_eps_chunk,
+    sigma_E_chunk,
+    psi_E,
+    courant_number,
+    a_pml, b_pml,
+    kappa_x, kappa_y, kappa_z,
+    periodic_axes,
+    x0_int, Cx, Nx,
+):
+    H_halo = _pad_yz(H_halo, periodic_axes) # shape: (Cx+1, Ny+2, Nz+2, 3)
+    Hx, Hy, Hz = H_halo[:, :, :, 0], H_halo[:, :, :, 1], H_halo[:, :, :, 2]
+    kappa_x_chunk = lax.dynamic_slice(kappa_x, (x0_int, 0, 0), (Cx, kappa_x.shape[1], kappa_x.shape[2]))
 
-    # --- derivatives for curl_H: H[i] - H[i-1] --------------------------
-    H_pad = _pad_xy(H_halo, periodic_axes)  # (3, Nx+2, Ny+2, Cz+1)
-
-    # x/y derivs use roll on the padded axes, then crop xy padding and z-halo.
-    dyHz = (H_pad[2] - jnp.roll(H_pad[2], 1, axis=1))[1:-1, 1:-1, 1:]
-    dyHx = (H_pad[0] - jnp.roll(H_pad[0], 1, axis=1))[1:-1, 1:-1, 1:]
-    dxHz = (H_pad[2] - jnp.roll(H_pad[2], 1, axis=0))[1:-1, 1:-1, 1:]
-    dxHy = (H_pad[1] - jnp.roll(H_pad[1], 1, axis=0))[1:-1, 1:-1, 1:]
-    # z derivs: explicit adjacent diff (roll would wrap incorrectly in z)
-    dzHy = H_pad[1, 1:-1, 1:-1, 1:] - H_pad[1, 1:-1, 1:-1, :-1]
-    dzHx = H_pad[0, 1:-1, 1:-1, 1:] - H_pad[0, 1:-1, 1:-1, :-1]
+    dyHz = Hz[1:, 1:-1, 1:-1] - Hz[1:, :-2, 1:-1]
+    dyHx = Hx[1:, 1:-1, 1:-1] - Hx[1:, :-2, 1:-1]
+    dxHz = Hz[1:, 1:-1, 1:-1] - Hz[:-1, 1:-1, 1:-1]
+    dxHy = Hy[1:, 1:-1, 1:-1] - Hy[:-1, 1:-1, 1:-1]
+    dzHy = Hy[1:, 1:-1, 1:-1] - Hy[1:, 1:-1, :-2]
+    dzHx = Hx[1:, 1:-1, 1:-1] - Hx[1:, 1:-1, :-2]
 
     d_fields = (dyHz, dzHy, dzHx, dxHz, dxHy, dyHx)
 
-    # --- kappa-scaled curl ------------------------------------------------
-    curl_x = (1.0 / kappa_y) * dyHz - (1.0 / kappa_z_chunk) * dzHy
-    curl_y = (1.0 / kappa_z_chunk) * dzHx - (1.0 / kappa_x) * dxHz
-    curl_z = (1.0 / kappa_x) * dxHy - (1.0 / kappa_y) * dyHx
+    curl_x = (1.0 / kappa_y) * dyHz - (1.0 / kappa_z) * dzHy
+    curl_y = (1.0 / kappa_z) * dzHx - (1.0 / kappa_x_chunk) * dxHz
+    curl_z = (1.0 / kappa_x_chunk) * dxHy - (1.0 / kappa_y) * dyHx
     curls = [curl_x, curl_y, curl_z]
 
-    # --- PML psi update & scatter into curl -------------------------------
     psi_list = list(psi_E)
     for i in range(6):
         axis = PSI_COMPONENT_AXIS[i]
-        ci = PSI_E_COEFF_IDX[i]
+        ci, cidx, sign = PSI_E_COEFF_IDX[i], _CURL_IDX[i], _CURL_SIGN[i]
         psi_min_i, psi_max_i = psi_list[i]
-        cidx = _CURL_IDX[i]
-        sign = _CURL_SIGN[i]
 
-        if axis != 2:
-            psi_min_i, psi_max_i, psi_min_c, psi_max_c = _pml_update_xy(
-                psi_min_i, psi_max_i, d_fields[i],
-                b_pml[ci], a_pml[ci], axis, z0, Cz,
+        if axis == 0:
+            psi_min_i, psi_max_i = _pml_update_x_xf(
+                psi_min_i, psi_max_i, d_fields[i], b_pml[ci], a_pml[ci],
+                x0_int, Cx, Nx,
             )
-            curls[cidx] = _scatter_psi_component(
-                curls[cidx], psi_min_c, psi_max_c, axis, sign,
-            )
+            curls[cidx] = _scatter_x_psi_xf(curls[cidx], psi_min_i, psi_max_i, sign, x0_int, Cx, Nx)
         else:
-            psi_min_i, psi_max_i = _pml_update_z(
-                psi_min_i, psi_max_i, d_fields[i],
-                b_pml[ci], a_pml[ci], z0, Cz, Nz,
+            psi_min_c = lax.dynamic_slice(psi_min_i, (x0_int, 0, 0), (Cx, psi_min_i.shape[1], psi_min_i.shape[2]))
+            psi_max_c = lax.dynamic_slice(psi_max_i, (x0_int, 0, 0), (Cx, psi_max_i.shape[1], psi_max_i.shape[2]))
+            psi_min_c, psi_max_c = _update_sparse_psi(
+                psi_min_c, psi_max_c, b_pml[ci], a_pml[ci], d_fields[i], axis,
             )
-            curls[cidx] = _scatter_z_psi(
-                curls[cidx], psi_min_i, psi_max_i, sign, z0, Cz, Nz,
-            )
+            psi_min_i = lax.dynamic_update_slice(psi_min_i, psi_min_c, (x0_int, 0, 0))
+            psi_max_i = lax.dynamic_update_slice(psi_max_i, psi_max_c, (x0_int, 0, 0))
+            curls[cidx] = _scatter_psi_component(curls[cidx], psi_min_c, psi_max_c, axis, sign)
+
         psi_list[i] = (psi_min_i, psi_max_i)
 
-    curl = jnp.stack(curls, axis=0)  # (3, Nx, Ny, Cz)
-
-    # --- material update: E = factor*E + c*curl*inv_eps -------------------
+    curl = jnp.stack(curls, axis=3) # shape: (Cx, Ny, Nz, 3)
     c = courant_number
-    if has_conductivity:
+    if sigma_E_chunk is not None:
         loss = c * sigma_E_chunk * eta0 * inv_eps_chunk / 2
         E_new = (1 - loss) * E_chunk + c * curl * inv_eps_chunk
         E_new = E_new / (1 + loss)
@@ -627,87 +262,70 @@ def _update_E_chunk(
     return E_new, tuple(psi_list)
 
 
-# ---------------------------------------------------------------------------
-# JIT-compiled per-chunk H update
-# ---------------------------------------------------------------------------
-
-@partial(jax.jit, static_argnames=("Cz", "Nz", "periodic_axes", "has_conductivity", "mu_is_scalar"),
-         donate_argnums=(0, 1, 4))
+@partial(
+    jax.jit,
+    donate_argnames=("H_chunk", "psi_H"),
+    static_argnames=("Cx", "Nx", "periodic_axes", "courant_number"),
+)
 def _update_H_chunk(
-    H_chunk: jax.Array,
-    E_halo: jax.Array,
-    inv_mu_chunk: jax.Array,
-    sigma_H_chunk: jax.Array,
-    psi_H: SparsePsi,
-    b_pml: tuple[jax.Array, ...],
-    a_pml: tuple[jax.Array, ...],
-    kappa_x: jax.Array,
-    kappa_y: jax.Array,
-    kappa_z_chunk: jax.Array,
-    z0: jax.Array,
-    courant_number: jax.Array,
-    Nz: int,
-    Cz: int,
-    periodic_axes: tuple[bool, bool, bool],
-    has_conductivity: bool,
-    mu_is_scalar: bool,
-) -> tuple[jax.Array, SparsePsi]:
-    """Compute one z-chunk of the H-field update (curl_E → PML → material)."""
+    H_chunk,
+    E_halo,
+    inv_mu_chunk,
+    sigma_H_chunk,
+    psi_H,
+    courant_number,
+    a_pml, b_pml,
+    kappa_x, kappa_y, kappa_z,
+    periodic_axes,
+    x0_int, Cx, Nx,
+):
+    E_halo = _pad_yz(E_halo, periodic_axes)  # shape: (Cx+1, Ny+2, Nz+2, 3)
+    Ex, Ey, Ez = E_halo[:, :, :, 0], E_halo[:, :, :, 1], E_halo[:, :, :, 2]
+    kappa_x_chunk = lax.dynamic_slice(kappa_x, (x0_int, 0, 0), (Cx, kappa_x.shape[1], kappa_x.shape[2]))
 
-    # --- derivatives for curl_E: E[i+1] - E[i] ---------------------------
-    E_pad = _pad_xy(E_halo, periodic_axes)  # (3, Nx+2, Ny+2, Cz+1)
-
-    # x/y derivs: roll -1 gives E[i+1]; crop xy padding and right z-halo.
-    dyEz = (jnp.roll(E_pad[2], -1, axis=1) - E_pad[2])[1:-1, 1:-1, :-1]
-    dyEx = (jnp.roll(E_pad[0], -1, axis=1) - E_pad[0])[1:-1, 1:-1, :-1]
-    dxEz = (jnp.roll(E_pad[2], -1, axis=0) - E_pad[2])[1:-1, 1:-1, :-1]
-    dxEy = (jnp.roll(E_pad[1], -1, axis=0) - E_pad[1])[1:-1, 1:-1, :-1]
-    # z derivs: explicit adjacent diff
-    dzEy = E_pad[1, 1:-1, 1:-1, 1:] - E_pad[1, 1:-1, 1:-1, :-1]
-    dzEx = E_pad[0, 1:-1, 1:-1, 1:] - E_pad[0, 1:-1, 1:-1, :-1]
+    dyEz = Ez[:-1, 2:, 1:-1] - Ez[:-1, 1:-1, 1:-1]
+    dyEx = Ex[:-1, 2:, 1:-1] - Ex[:-1, 1:-1, 1:-1]
+    dxEz = Ez[1:, 1:-1, 1:-1] - Ez[:-1, 1:-1, 1:-1]
+    dxEy = Ey[1:, 1:-1, 1:-1] - Ey[:-1, 1:-1, 1:-1]
+    dzEy = Ey[:-1, 1:-1, 2:] - Ey[:-1, 1:-1, 1:-1]
+    dzEx = Ex[:-1, 1:-1, 2:] - Ex[:-1, 1:-1, 1:-1]
 
     d_fields = (dyEz, dzEy, dzEx, dxEz, dxEy, dyEx)
 
-    # --- kappa-scaled curl ------------------------------------------------
-    curl_x = (1.0 / kappa_y) * dyEz - (1.0 / kappa_z_chunk) * dzEy
-    curl_y = (1.0 / kappa_z_chunk) * dzEx - (1.0 / kappa_x) * dxEz
-    curl_z = (1.0 / kappa_x) * dxEy - (1.0 / kappa_y) * dyEx
+    curl_x = (1.0 / kappa_y) * dyEz - (1.0 / kappa_z) * dzEy
+    curl_y = (1.0 / kappa_z) * dzEx - (1.0 / kappa_x_chunk) * dxEz
+    curl_z = (1.0 / kappa_x_chunk) * dxEy - (1.0 / kappa_y) * dyEx
     curls = [curl_x, curl_y, curl_z]
 
-    # --- PML psi update & scatter -----------------------------------------
     psi_list = list(psi_H)
     for i in range(6):
         axis = PSI_COMPONENT_AXIS[i]
-        ci = PSI_H_COEFF_IDX[i]
+        ci, cidx, sign = PSI_H_COEFF_IDX[i], _CURL_IDX[i], _CURL_SIGN[i]
         psi_min_i, psi_max_i = psi_list[i]
-        cidx = _CURL_IDX[i]
-        sign = _CURL_SIGN[i]
 
-        if axis != 2:
-            psi_min_i, psi_max_i, psi_min_c, psi_max_c = _pml_update_xy(
-                psi_min_i, psi_max_i, d_fields[i],
-                b_pml[ci], a_pml[ci], axis, z0, Cz,
+        if axis == 0:
+            psi_min_i, psi_max_i = _pml_update_x_xf(
+                psi_min_i, psi_max_i, d_fields[i], b_pml[ci], a_pml[ci],
+                x0_int, Cx, Nx,
             )
-            curls[cidx] = _scatter_psi_component(
-                curls[cidx], psi_min_c, psi_max_c, axis, sign,
-            )
+            curls[cidx] = _scatter_x_psi_xf(curls[cidx], psi_min_i, psi_max_i, sign, x0_int, Cx, Nx)
         else:
-            psi_min_i, psi_max_i = _pml_update_z(
-                psi_min_i, psi_max_i, d_fields[i],
-                b_pml[ci], a_pml[ci], z0, Cz, Nz,
+            psi_min_c = lax.dynamic_slice(psi_min_i, (x0_int, 0, 0), (Cx, psi_min_i.shape[1], psi_min_i.shape[2]))
+            psi_max_c = lax.dynamic_slice(psi_max_i, (x0_int, 0, 0), (Cx, psi_max_i.shape[1], psi_max_i.shape[2]))
+            psi_min_c, psi_max_c = _update_sparse_psi(
+                psi_min_c, psi_max_c, b_pml[ci], a_pml[ci], d_fields[i], axis,
             )
-            curls[cidx] = _scatter_z_psi(
-                curls[cidx], psi_min_i, psi_max_i, sign, z0, Cz, Nz,
-            )
+            psi_min_i = lax.dynamic_update_slice(psi_min_i, psi_min_c, (x0_int, 0, 0))
+            psi_max_i = lax.dynamic_update_slice(psi_max_i, psi_max_c, (x0_int, 0, 0))
+            curls[cidx] = _scatter_psi_component(curls[cidx], psi_min_c, psi_max_c, axis, sign)
+
         psi_list[i] = (psi_min_i, psi_max_i)
 
-    curl = jnp.stack(curls, axis=0)
-
-    # --- material update: H = factor*H - c*curl*inv_mu -------------------
+    curl = jnp.stack(curls, axis=3)  # shape: (Cx, Ny, Nz, 3)
     c = courant_number
-    inv_mu = inv_mu_chunk if not mu_is_scalar else 1.0
-    if has_conductivity:
-        loss = c * sigma_H_chunk / eta0 * inv_mu / 2
+    inv_mu = inv_mu_chunk if inv_mu_chunk is not None else 1.0
+    if sigma_H_chunk is not None:
+        loss = c * sigma_H_chunk * inv_mu / eta0 / 2
         H_new = (1 - loss) * H_chunk - c * curl * inv_mu
         H_new = H_new / (1 + loss)
     else:
@@ -717,675 +335,543 @@ def _update_H_chunk(
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Source and detector helpers (x-first layout: Nx, Ny, Nz, 3)
 # ---------------------------------------------------------------------------
 
-def _auto_chunk_size(
-    Nz: int,
-    Nx: int,
-    Ny: int,
-    C_eps: int,
-    has_conductivity: bool,
-    mu_is_scalar: bool,
-    dtype_bytes: int,
-    gpu_budget_bytes: int,
-) -> int:
-    """Pick the largest chunk_size that divides Nz and fits in GPU memory.
-
-    Conservative estimate: per-chunk GPU allocation includes the input arrays
-    (E, H_halo, inv_eps, optionally sigma, inv_mu) plus XLA intermediates
-    for the curl + PML computation (~8x the raw input footprint).
-    """
-    cell_bytes = Nx * Ny * dtype_bytes
-    # Input arrays per z-cell:
-    #   E_chunk:     3 cells
-    #   H_halo:      3 cells (Cz+1, so +3 cells total overhead)
-    #   inv_eps:     C_eps cells
-    #   sigma_E/H:   C_eps cells each (if present)
-    #   inv_mu:      C_eps cells (if array)
-    #   result:      3 cells
-    arrays_per_z = 3 + 3 + C_eps + 3  # E, H_halo, eps, result
-    if has_conductivity:
-        arrays_per_z += C_eps * 2  # sigma_E + sigma_H
-    if not mu_is_scalar:
-        arrays_per_z += C_eps
-
-    # XLA intermediate multiplier (curl derivatives, padding, PML scatter, etc.)
-    xla_multiplier = 8
-    bytes_per_z = arrays_per_z * cell_bytes * xla_multiplier
-    # Fixed overhead for the H_halo extra slice (+1 in z)
-    fixed_overhead = 3 * cell_bytes * xla_multiplier
-
-    max_cz = max(1, int((gpu_budget_bytes - fixed_overhead) // bytes_per_z))
-
-    # Find the largest divisor of Nz that is <= max_cz
-    best = 1
-    for d in range(1, min(max_cz, Nz) + 1):
-        if Nz % d == 0:
-            best = d
-    return best
-
-
-def tiled_fdtd(
-    arrays: ArrayContainer,
-    objects: ObjectContainer,
-    config: SimulationConfig,
-    key: jax.Array,
-    chunk_size: int | None = None,
-) -> SimulationState:
-    """Run a forward-only FDTD simulation with CPU-GPU tiled streaming.
-
-    Large field and material arrays live in CPU (Grace) memory.  Each time step
-    is broken into z-axis chunks that are streamed to the GPU (Hopper) for
-    computation, avoiding the page-fault thrashing of CUDA unified memory.
-
-    Args:
-        arrays: Initial simulation state (fields, materials, etc.).
-        objects: Simulation objects (sources, detectors, boundaries, …).
-        config: Simulation configuration.
-        key: JAX PRNG key (unused in forward-only mode, kept for API compat).
-        chunk_size: Number of z-cells per GPU chunk.  Must divide ``Nz``.
-            Larger values increase GPU utilisation at the cost of GPU memory.
-            If ``None`` (default), automatically selects the largest chunk size
-            that fits in GPU memory.
-
-    .. warning::
-        This function **deletes the underlying XLA buffers** of the input
-        ``arrays`` to free GPU memory.  The caller's reference to the input
-        ``ArrayContainer`` will contain invalidated arrays after this call.
-        Always use the returned ``arrays`` for subsequent work.
-
-    Returns:
-        ``(time_step, arrays)`` — same shape as ``checkpointed_fdtd``.
-    """
-    print_timestamp()
-    print("Starting tiled_fdtd")
-
-    import gc
-
-    del key  # unused in forward-only
-
-    # On GH200 in NUMA mode, ensure allocations land on CPU LPDDR5X
-    _pin_memory_to_cpu()
-
-    # ------------------------------------------------------------------
-    # 0. Validate
-    # ------------------------------------------------------------------
-    inv_eps = arrays.inv_permittivities
-    if inv_eps.shape[0] == 9:
-        raise NotImplementedError(
-            "Tiled FDTD does not yet support fully anisotropic materials "
-            "(inv_permittivities shape[0] == 9).  Use diagonal anisotropy "
-            "(shape[0] == 3) or isotropic (shape[0] == 1)."
-        )
-
-    # ------------------------------------------------------------------
-    # 1. Device handles
-    # ------------------------------------------------------------------
-    gpu = jax.devices("gpu")[0]
-    np_dtype = np.float32 if config.dtype == jnp.float32 else np.float64
-
-    # ------------------------------------------------------------------
-    # 2. Extract data from ArrayContainer into numpy / GPU arrays.
-    #    FREE each large JAX buffer IMMEDIATELY after extracting its
-    #    CPU copy so GPU HBM is reclaimed before the next extraction.
-    #    Without this, all 75+ GB of field/material arrays stay on GPU
-    #    simultaneously and OOM when PML/detector setup needs more room.
-    #
-    #    All large numpy arrays use Z-FIRST layout: (Nz, C, Nx, Ny).
-    #    First-axis slices are C-contiguous → no strided copies needed.
-    #    Arrays are CUDA-pinned so jax.device_put uses fast DMA.
-    # ------------------------------------------------------------------
-    field_shape = arrays.E.shape  # (3, Nx, Ny, Nz) — original layout
-    _, Nx, Ny, Nz = field_shape
-
-    # Save recording_state and detector info before freeing anything
-    _saved_recording_state = arrays.recording_state
-    has_detectors = bool(objects.forward_detectors)
-    has_sigma_E = arrays.electric_conductivity is not None
-    has_sigma_H = arrays.magnetic_conductivity is not None
-
-    # Fields are zero (reset) — create numpy directly, free GPU originals
-    E_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
-    H_np = np.zeros((Nz, 3, Nx, Ny), dtype=np_dtype)
-    _free_jax_buffer(arrays.E)
-    _free_jax_buffer(arrays.H)
-    gc.collect()
-    print(f"  [tiled_fdtd] Freed E+H from GPU  {_gpu_mem_info()}")
-
-    # Material arrays: extract to CPU, free GPU copy immediately
-    inv_eps_np = _to_zfirst(np.array(jax.device_get(arrays.inv_permittivities)))
-    _free_jax_buffer(arrays.inv_permittivities)
-    del inv_eps
-    gc.collect()
-    print(f"  [tiled_fdtd] Freed inv_eps from GPU  {_gpu_mem_info()}")
-
-    sigma_E_np = _to_zfirst(np.array(jax.device_get(arrays.electric_conductivity))) if has_sigma_E else None
-    if has_sigma_E:
-        _free_jax_buffer(arrays.electric_conductivity)
-
-    sigma_H_np = _to_zfirst(np.array(jax.device_get(arrays.magnetic_conductivity))) if has_sigma_H else None
-    if has_sigma_H:
-        _free_jax_buffer(arrays.magnetic_conductivity)
-
-    inv_mu_val = arrays.inv_permeabilities
-    mu_is_scalar = not isinstance(inv_mu_val, jax.Array) or inv_mu_val.ndim == 0
-    if mu_is_scalar:
-        inv_mu_scalar = float(jax.device_get(jnp.asarray(inv_mu_val)))
-    else:
-        inv_mu_scalar = None
-    inv_mu_np = None if mu_is_scalar else _to_zfirst(np.array(jax.device_get(inv_mu_val)))
-    if not mu_is_scalar:
-        _free_jax_buffer(inv_mu_val)
-    del inv_mu_val
-    gc.collect()
-    print(f"  [tiled_fdtd] Freed materials from GPU  {_gpu_mem_info()}")
-
-    # Detector states — zero (reset), keep on GPU to avoid per-step transfers.
-    detector_states_gpu: dict = {}
-    for k, v in arrays.detector_states.items():
-        detector_states_gpu[k] = {}
-        for k2, v2 in v.items():
-            detector_states_gpu[k][k2] = jax.device_put(v2 * 0, gpu)
-            _free_jax_buffer(v2)
-
-    # PML → GPU (small, stay resident).  Zero the psi fields (reset).
-    psi_E: SparsePsi = jax.device_put(
-        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_E), gpu,
-    )
-    psi_H: SparsePsi = jax.device_put(
-        tuple((p_min * 0, p_max * 0) for p_min, p_max in arrays.psi_H), gpu,
-    )
-    alpha = tuple(jax.device_put(a, gpu) for a in arrays.alpha)
-    kappa = tuple(jax.device_put(k, gpu) for k in arrays.kappa)
-    sigma_pml = tuple(jax.device_put(s, gpu) for s in arrays.sigma)
-
-    b_pml, a_pml = _compute_pml_ab(alpha, kappa, sigma_pml, config)
-
-    kappa_x = kappa[0]   # (Nx, 1, 1)
-    kappa_y = kappa[1]   # (1, Ny, 1)
-    kappa_z_full = kappa[2]  # (1, 1, Nz) — sliced per chunk
-
-    gc.collect()
-
-    # Prefetch PML arrays into HBM so they never trigger page faults.
-    for _psi_pair in psi_E + psi_H:
-        for _p in _psi_pair:
-            _prefetch_to_hbm(_p)
-    for _coeff_tuple in (b_pml, a_pml):
-        for _c in _coeff_tuple:
-            _prefetch_to_hbm(_c)
-    _prefetch_to_hbm(kappa_x)
-    _prefetch_to_hbm(kappa_y)
-    _prefetch_to_hbm(kappa_z_full)
-    _rt_init = _get_cudart()
-    if _rt_init:
-        import ctypes as _ct
-        _rt_init.cudaStreamSynchronize(_ct.c_void_p(2))
-    print(f"  [tiled_fdtd] PML+detectors prefetched to HBM  {_gpu_mem_info()}")
-
-    # CUDA-pin the large z-first numpy arrays for fast DMA
-    print("  [tiled_fdtd] Pinning host arrays...")
-    _cuda_pin(E_np, "E_np")
-    _cuda_pin(H_np, "H_np")
-    _cuda_pin(inv_eps_np, "inv_eps_np")
-    if sigma_E_np is not None:
-        _cuda_pin(sigma_E_np, "sigma_E_np")
-    if sigma_H_np is not None:
-        _cuda_pin(sigma_H_np, "sigma_H_np")
-    if inv_mu_np is not None:
-        _cuda_pin(inv_mu_np, "inv_mu_np")
-
-    # ------------------------------------------------------------------
-    # 3. Chunk configuration
-    # ------------------------------------------------------------------
-    C_eps = inv_eps_np.shape[1]  # z-first: (Nz, C, Nx, Ny)
-    dtype_bytes = 4 if np_dtype == np.float32 else 8
-
-    if chunk_size is None:
-        # Query GPU memory and subtract a safety margin for PML + JIT overhead
-        gpu_mem = gpu.memory_stats()
-        if gpu_mem and "bytes_limit" in gpu_mem:
-            total_bytes = gpu_mem["bytes_limit"]
-            in_use = gpu_mem.get("bytes_in_use", 0)
-            available = int((total_bytes - in_use) * 0.75)  # 75% safety margin
-        else:
-            available = 80 * 1024**3  # conservative 80 GB fallback
-        Cz = _auto_chunk_size(
-            Nz, Nx, Ny, C_eps,
-            has_conductivity=has_sigma_E,
-            mu_is_scalar=mu_is_scalar,
-            dtype_bytes=dtype_bytes,
-            gpu_budget_bytes=available,
-        )
-        print(f"Auto chunk_size = {Cz}  ({Nz // Cz} chunks, "
-              f"GPU budget {available / 1024**3:.1f} GB)")
-    else:
-        Cz = chunk_size
-
-    if Nz % Cz != 0:
-        raise ValueError(
-            f"Nz ({Nz}) must be divisible by chunk_size ({Cz}).  "
-            f"Try chunk_size={Nz // max(1, Nz // Cz)}."
-        )
-    n_chunks = Nz // Cz
-
-    periodic_axes = get_periodic_axes(objects)
-    periodic_z = periodic_axes[2]
-    c_num = jnp.asarray(config.courant_number, dtype=config.dtype)
-
-    _dummy_sigma = jnp.zeros((1,), dtype=config.dtype)
-
-    print_timestamp()
-    print(f"Time loop starting")
-
-    # ------------------------------------------------------------------
-    # 4. Time loop
-    # ------------------------------------------------------------------
-    for t in range(config.time_steps_total):
-        if t % 1 == 0:
-            print_timestamp()
-            print(f"Time step {t} of {config.time_steps_total}")
-        time_step = jnp.asarray(t, dtype=jnp.int32)
-
-        # ==============================================================
-        # Phase 1 — E update  (reads H, writes E)
-        # ==============================================================
-        print_timestamp()
-        if t < 5:
-            print(f"E update starting  gpu_mem={_gpu_mem_info()}")
-        else:
-            print(f"E update starting")
-        import time as _time
-        _chunk_times_E = []
-        for iz in range(n_chunks):
-            z0_int = iz * Cz
-            z1_int = z0_int + Cz
-            z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
-
-            _t0 = _time.perf_counter()
-            H_halo = _build_H_halo_for_E(H_np, z0_int, z1_int, Nz, Cz, periodic_z, gpu)
-            _t1 = _time.perf_counter()
-            E_chunk = _zf_to_gpu(E_np[z0_int:z1_int], gpu)
-            _t2 = _time.perf_counter()
-            eps_chunk = _zf_to_gpu(inv_eps_np[z0_int:z1_int], gpu)
-            _t3 = _time.perf_counter()
-            sig_E_chunk = (
-                _zf_to_gpu(sigma_E_np[z0_int:z1_int], gpu)  # type: ignore[index]
-                if has_sigma_E else _dummy_sigma
-            )
-            kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
-
-            _t4 = _time.perf_counter()
-            E_new, psi_E = _update_E_chunk(
-                E_chunk, H_halo, eps_chunk, sig_E_chunk,
-                psi_E, b_pml, a_pml,
-                kappa_x, kappa_y, kz_chunk,
-                z0_jax, c_num,
-                Nz=Nz, Cz=Cz,
-                periodic_axes=periodic_axes,
-                has_conductivity=has_sigma_E,
-            )
-            del E_chunk, H_halo, eps_chunk, sig_E_chunk, kz_chunk
-            _t5 = _time.perf_counter()
-
-            _diag = f"E{iz}" if t < 5 and (iz < 5 or iz % 5 == 0) else ""
-            _gpu_to_pinned_zf(E_new, E_np[z0_int:z1_int], diag_label=_diag)
-            del E_new
-            _t6 = _time.perf_counter()
-            _chunk_times_E.append(_t6 - _t0)
-
-            _chunk_total = _t6 - _t0
-            if t < 5 and (iz < 5 or _chunk_total > 1.0):
-                print(f"  E chunk {iz}: halo={_t1-_t0:.3f}s  E_put={_t2-_t1:.3f}s  "
-                      f"eps_put={_t3-_t2:.3f}s  sig+kz={_t4-_t3:.3f}s  "
-                      f"kernel={_t5-_t4:.3f}s  get+write={_t6-_t5:.3f}s  "
-                      f"total={_chunk_total:.3f}s"
-                      + (" *** SLOW ***" if _chunk_total > 1.0 and iz >= 5 else ""))
-        if t < 5:
-            _ct = _chunk_times_E
-            _slow = [(i, c) for i, c in enumerate(_ct) if c > 0.5]
-            print(f"  E summary: total={sum(_ct):.1f}s  "
-                  f"min={min(_ct):.3f}s  max={max(_ct):.1f}s  "
-                  f"avg={sum(_ct)/len(_ct):.3f}s  "
-                  f"stalls(>0.5s)={len(_slow)}"
-                  + (f"  worst={_slow[:3]}" if _slow else ""))
-
-        # --- E-field sources (on GPU, small region only) ---
-        print_timestamp()
-        print(f"E-field sources starting")
-        _apply_sources_E_gpu(
-            E_np, inv_eps_np, inv_mu_np, mu_is_scalar, inv_mu_scalar,
-            objects, time_step, config.dtype, gpu,
-        )
-
-        # Flush deferred XLA buffer frees so the H chunk loop starts clean.
-        import gc as _gc
-        _tgc0 = _time.perf_counter()
-        _gc.collect()
-        _tgc1 = _time.perf_counter()
-        # Force full CUDA device sync to drain ALL streams (not just XLA compute).
-        _tsync0 = _time.perf_counter()
-        _rt = _get_cudart()
-        if _rt:
-            _rt.cudaDeviceSynchronize()
-        _tsync1 = _time.perf_counter()
-        if t < 5:
-            print(f"  gc between E-src → H: {_tgc1 - _tgc0:.3f}s  "
-                  f"device_sync={_tsync1 - _tsync0:.3f}s  "
-                  f"gpu_mem={_gpu_mem_info()}")
-
-        # ==============================================================
-        # Phase 2 — H update  (reads E, writes H)
-        # ==============================================================
-        print_timestamp()
-        if t < 5:
-            print(f"H update starting  gpu_mem={_gpu_mem_info()}")
-        else:
-            print(f"H update starting")
-        _chunk_times_H = []
-        for iz in range(n_chunks):
-            z0_int = iz * Cz
-            z1_int = z0_int + Cz
-            z0_jax = jnp.asarray(z0_int, dtype=jnp.int32)
-
-            _t0 = _time.perf_counter()
-            E_halo = _build_E_halo_for_H(E_np, z0_int, z1_int, Nz, Cz, periodic_z, gpu)
-            _t1 = _time.perf_counter()
-            H_chunk = _zf_to_gpu(H_np[z0_int:z1_int], gpu)
-            _t2 = _time.perf_counter()
-
-            if mu_is_scalar:
-                mu_chunk = jnp.asarray(1.0, dtype=config.dtype)
-            else:
-                mu_chunk = _zf_to_gpu(inv_mu_np[z0_int:z1_int], gpu)  # type: ignore[index]
-
-            sig_H_chunk = (
-                _zf_to_gpu(sigma_H_np[z0_int:z1_int], gpu)  # type: ignore[index]
-                if has_sigma_H else _dummy_sigma
-            )
-            kz_chunk = kappa_z_full[:, :, z0_int:z1_int]
-
-            _t3 = _time.perf_counter()
-            H_new, psi_H = _update_H_chunk(
-                H_chunk, E_halo, mu_chunk, sig_H_chunk,
-                psi_H, b_pml, a_pml,
-                kappa_x, kappa_y, kz_chunk,
-                z0_jax, c_num,
-                Nz=Nz, Cz=Cz,
-                periodic_axes=periodic_axes,
-                has_conductivity=has_sigma_H,
-                mu_is_scalar=mu_is_scalar,
-            )
-            del H_chunk, E_halo, mu_chunk, sig_H_chunk, kz_chunk
-            _t4 = _time.perf_counter()
-
-            _diag = f"H{iz}" if t < 5 and (iz < 5 or iz % 5 == 0) else ""
-            _gpu_to_pinned_zf(H_new, H_np[z0_int:z1_int], diag_label=_diag)
-            del H_new
-            _t5 = _time.perf_counter()
-            _chunk_times_H.append(_t5 - _t0)
-
-            _chunk_total = _t5 - _t0
-            if t < 5 and (iz < 5 or _chunk_total > 1.0):
-                print(f"  H chunk {iz}: halo={_t1-_t0:.3f}s  H_put={_t2-_t1:.3f}s  "
-                      f"mu+sig+kz={_t3-_t2:.3f}s  "
-                      f"kernel={_t4-_t3:.3f}s  get+write={_t5-_t4:.3f}s  "
-                      f"total={_chunk_total:.3f}s"
-                      + (" *** SLOW ***" if _chunk_total > 1.0 and iz >= 5 else ""))
-        if t < 5:
-            _ct = _chunk_times_H
-            _slow = [(i, c) for i, c in enumerate(_ct) if c > 0.5]
-            print(f"  H summary: total={sum(_ct):.1f}s  "
-                  f"min={min(_ct):.3f}s  max={max(_ct):.1f}s  "
-                  f"avg={sum(_ct)/len(_ct):.3f}s  "
-                  f"stalls(>0.5s)={len(_slow)}"
-                  + (f"  worst={_slow[:3]}" if _slow else ""))
-
-        # --- H-field sources (on GPU, small region only) ---
-        print_timestamp()
-        print(f"H-field sources starting")
-        _apply_sources_H_gpu(
-            H_np, inv_eps_np, inv_mu_np, mu_is_scalar, inv_mu_scalar,
-            objects, time_step, config.dtype, gpu,
-        )
-
-        # ==============================================================
-        # Detector update (on GPU, small sliced regions only)
-        # ==============================================================
-        print_timestamp()
-        print(f"Detector update starting")
-        if has_detectors:
-            detector_states_gpu = _update_detectors_gpu(
-                E_np, H_np, inv_eps_np, inv_mu_np,
-                mu_is_scalar, inv_mu_scalar,
-                detector_states_gpu, objects, time_step, gpu,
-            )
-
-        # Flush deferred XLA buffer frees before next time step's E update.
-        _tgc0 = _time.perf_counter()
-        _gc.collect()
-        _tgc1 = _time.perf_counter()
-        _tsync0 = _time.perf_counter()
-        if _rt:
-            _rt.cudaDeviceSynchronize()
-        _tsync1 = _time.perf_counter()
-        if t < 5:
-            print(f"  gc between det → next E: {_tgc1 - _tgc0:.3f}s  "
-                  f"device_sync={_tsync1 - _tsync0:.3f}s  "
-                  f"gpu_mem={_gpu_mem_info()}")
-
-    # ------------------------------------------------------------------
-    # 5. Reconstruct output ArrayContainer
-    #    Transpose z-first numpy → original (C, Nx, Ny, Nz) layout.
-    #    We cannot use arrays.aset() because the input arrays' XLA
-    #    buffers were deleted — tree_copy would crash.  Construct fresh.
-    # ------------------------------------------------------------------
-    final_E = jnp.asarray(np.ascontiguousarray(np.transpose(E_np, (1, 2, 3, 0))))
-    final_H = jnp.asarray(np.ascontiguousarray(np.transpose(H_np, (1, 2, 3, 0))))
-    final_inv_eps = jnp.asarray(np.ascontiguousarray(np.transpose(inv_eps_np, (1, 2, 3, 0))))
-
-    final_sigma_E = (
-        jnp.asarray(np.ascontiguousarray(np.transpose(sigma_E_np, (1, 2, 3, 0))))  # type: ignore[arg-type]
-        if has_sigma_E else None
-    )
-    final_sigma_H = (
-        jnp.asarray(np.ascontiguousarray(np.transpose(sigma_H_np, (1, 2, 3, 0))))  # type: ignore[arg-type]
-        if has_sigma_H else None
-    )
-    if not mu_is_scalar:
-        final_inv_mu = jnp.asarray(np.ascontiguousarray(np.transpose(inv_mu_np, (1, 2, 3, 0))))  # type: ignore[arg-type]
-    else:
-        final_inv_mu = jnp.asarray(inv_mu_scalar)
-
-    out = ArrayContainer(
-        E=final_E,
-        H=final_H,
-        psi_E=psi_E,
-        psi_H=psi_H,
-        alpha=alpha,
-        kappa=kappa,
-        sigma=sigma_pml,
-        inv_permittivities=final_inv_eps,
-        inv_permeabilities=final_inv_mu,
-        detector_states=detector_states_gpu,
-        recording_state=_saved_recording_state,
-        electric_conductivity=final_sigma_E,
-        magnetic_conductivity=final_sigma_H,
-    )
-
-    final_time = jnp.asarray(config.time_steps_total, dtype=jnp.int32)
-    return (final_time, out)
-
-
-# ---------------------------------------------------------------------------
-# GPU source helpers — extract the source's small spatial region from numpy,
-# send it to GPU, remap grid_slice to zero-based, and run source.update_*
-# on GPU.  Only the tiny source region is transferred, not the full grid.
-# ---------------------------------------------------------------------------
-
-def _remap_to_gpu(
-    obj,
-    field_np: np.ndarray,
-    inv_eps_np: np.ndarray,
-    inv_mu_np: np.ndarray | None,
-    mu_is_scalar: bool,
-    inv_mu_scalar: float | None,
-    gpu,
-):
-    """Extract *obj*'s spatial region from z-first numpy arrays, send to GPU,
-    and return (remapped_obj, field_gpu, eps_gpu, mu_gpu).
-
-    field_np is (Nz, C, Nx, Ny).  The GPU arrays have kernel layout (C, dx, dy, dz).
-    The remapped object has ``_grid_slice_tuple`` set to
-    ``((0,dx),(0,dy),(0,dz))`` so ``grid_slice`` addresses the full
-    small array.
+def _remap_to_gpu_xfirst(obj, field_np, inv_eps_np, inv_mu_np, mu_is_scalar, inv_mu_scalar, gpu_device):
+    """Extract object region from x-first (Nx, Ny, Nz, 3) arrays and remap for GPU update.
+    Returns (obj_remap, field_gpu, eps_gpu, mu_gpu).
+    inv_mu_np can be None when mu_is_scalar is True.
     """
     gst = obj._grid_slice_tuple
+    sx, sy, sz = obj.grid_slice
     dx = gst[0][1] - gst[0][0]
     dy = gst[1][1] - gst[1][0]
     dz = gst[2][1] - gst[2][0]
-    sx, sy, sz = obj.grid_slice
 
-    # z-first: (Nz, C, Nx, Ny) → slice [sz, :, sx, sy] → (dz, C, dx, dy)
-    # then transpose to kernel layout (C, dx, dy, dz)
-    field_region = np.ascontiguousarray(
-        np.transpose(field_np[sz, :, sx, sy], (1, 2, 3, 0))
+    # field_np is (Nx, Ny, Nz, 3); slice gives (dx, dy, dz, 3)
+    # Source/detector interface expects (3, Nx, Ny, Nz) -> transpose to (3, dx, dy, dz)
+    field_slice = field_np[sx, sy, sz, :]
+    field_gpu = jax.device_put(
+        jnp.asarray(np.ascontiguousarray(np.transpose(field_slice, (3, 0, 1, 2)))),
+        gpu_device,
     )
-    field_gpu = jax.device_put(jnp.asarray(field_region), gpu)
-
-    eps_region = np.ascontiguousarray(
-        np.transpose(inv_eps_np[sz, :, sx, sy], (1, 2, 3, 0))
+    eps_slice = inv_eps_np[sx, sy, sz, :]
+    eps_gpu = jax.device_put(
+        jnp.asarray(np.ascontiguousarray(np.transpose(eps_slice, (3, 0, 1, 2)))),
+        gpu_device,
     )
-    eps_gpu = jax.device_put(jnp.asarray(eps_region), gpu)
-
     if mu_is_scalar:
         mu_gpu = inv_mu_scalar
     else:
-        mu_region = np.ascontiguousarray(
-            np.transpose(inv_mu_np[sz, :, sx, sy], (1, 2, 3, 0))  # type: ignore[index]
+        mu_slice = inv_mu_np[sx, sy, sz, :]
+        mu_gpu = jax.device_put(
+            jnp.asarray(np.ascontiguousarray(np.transpose(mu_slice, (3, 0, 1, 2)))),
+            gpu_device,
         )
-        mu_gpu = jax.device_put(jnp.asarray(mu_region), gpu)
-
     obj_remap = obj.aset("_grid_slice_tuple", ((0, dx), (0, dy), (0, dz)))
     return obj_remap, field_gpu, eps_gpu, mu_gpu
 
 
-def _apply_sources_E_gpu(
-    E_np: np.ndarray,
-    inv_eps_np: np.ndarray,
-    inv_mu_np: np.ndarray | None,
-    mu_is_scalar: bool,
-    inv_mu_scalar: float | None,
-    objects: ObjectContainer,
-    time_step: jax.Array,
-    dtype,
-    gpu,
-) -> None:
-    """Apply E-field sources on GPU using only the source's spatial region."""
+def _apply_sources_E(
+    E_cpu, inv_permittivities_cpu, inv_permeabilities_cpu,
+    has_inv_permeabilities, inv_mu_scalar, objects, time_step, gpu_device,
+):
+    """Apply E-field sources. E_cpu and inv_permittivities_cpu are (Nx, Ny, Nz, 3).
+    inv_permeabilities_cpu can be None when has_inv_permeabilities is False.
+    """
     for source in objects.sources:
         if not bool(jax.device_get(source.is_on_at_time_step(time_step))):
             continue
         adj = source.adjust_time_step_by_on_off(time_step)
         sx, sy, sz = source.grid_slice
-
-        src_remap, E_gpu, eps_gpu, mu_gpu = _remap_to_gpu(
-            source, E_np, inv_eps_np, inv_mu_np,
-            mu_is_scalar, inv_mu_scalar, gpu,
+        src_remap, E_gpu, eps_gpu, mu_gpu = _remap_to_gpu_xfirst(
+            source, E_cpu, inv_permittivities_cpu, inv_permeabilities_cpu,
+            not has_inv_permeabilities, inv_mu_scalar, gpu_device,
         )
         E_updated = src_remap.update_E(
-            E=E_gpu,
-            inv_permittivities=eps_gpu,
-            inv_permeabilities=mu_gpu,
-            time_step=adj,
-            inverse=False,
+            E=E_gpu, inv_permittivities=eps_gpu, inv_permeabilities=mu_gpu,
+            time_step=adj, inverse=False,
         )
-        # kernel layout (3, dx, dy, dz) → z-first (dz, 3, dx, dy)
-        E_np[sz, :, sx, sy] = np.transpose(
-            np.asarray(jax.device_get(E_updated)), (3, 0, 1, 2)
-        )
+        # E_updated is (3, dx, dy, dz); write back as (dx, dy, dz, 3)
+        E_cpu[sx, sy, sz, :] = np.asarray(jax.device_get(E_updated)).transpose((1, 2, 3, 0))
 
 
-def _apply_sources_H_gpu(
-    H_np: np.ndarray,
-    inv_eps_np: np.ndarray,
-    inv_mu_np: np.ndarray | None,
-    mu_is_scalar: bool,
-    inv_mu_scalar: float | None,
-    objects: ObjectContainer,
-    time_step: jax.Array,
-    dtype,
-    gpu,
-) -> None:
-    """Apply H-field sources on GPU using only the source's spatial region."""
+def _apply_sources_H(
+    H_cpu, inv_permittivities_cpu, inv_permeabilities_cpu,
+    has_inv_permeabilities, inv_mu_scalar, objects, time_step, gpu_device,
+):
+    """Apply H-field sources. H_cpu and inv_permittivities_cpu are (Nx, Ny, Nz, 3).
+    inv_permeabilities_cpu can be None when has_inv_permeabilities is False.
+    """
     for source in objects.sources:
         if not bool(jax.device_get(source.is_on_at_time_step(time_step))):
             continue
         adj = source.adjust_time_step_by_on_off(time_step)
         sx, sy, sz = source.grid_slice
-
-        src_remap, H_gpu, eps_gpu, mu_gpu = _remap_to_gpu(
-            source, H_np, inv_eps_np, inv_mu_np,
-            mu_is_scalar, inv_mu_scalar, gpu,
+        src_remap, H_gpu, eps_gpu, mu_gpu = _remap_to_gpu_xfirst(
+            source, H_cpu, inv_permittivities_cpu, inv_permeabilities_cpu,
+            not has_inv_permeabilities, inv_mu_scalar, gpu_device,
         )
         H_updated = src_remap.update_H(
-            H=H_gpu,
-            inv_permittivities=eps_gpu,
-            inv_permeabilities=mu_gpu,
-            time_step=adj + 0.5,
-            inverse=False,
+            H=H_gpu, inv_permittivities=eps_gpu, inv_permeabilities=mu_gpu,
+            time_step=adj + 0.5, inverse=False,
         )
-        H_np[sz, :, sx, sy] = np.transpose(
-            np.asarray(jax.device_get(H_updated)), (3, 0, 1, 2)
-        )
+        H_cpu[sx, sy, sz, :] = np.asarray(jax.device_get(H_updated)).transpose((1, 2, 3, 0))
 
 
-# ---------------------------------------------------------------------------
-# GPU detector update — extract each detector's small spatial region, send
-# to GPU, remap grid_slice, and run d.update() on GPU.  Detector states
-# stay on GPU between time steps to avoid per-step transfers.
-# ---------------------------------------------------------------------------
-
-def _update_detectors_gpu(
-    E_np: np.ndarray,
-    H_np: np.ndarray,
-    inv_eps_np: np.ndarray,
-    inv_mu_np: np.ndarray | None,
-    mu_is_scalar: bool,
-    inv_mu_scalar: float | None,
-    detector_states: dict,
-    objects: ObjectContainer,
-    time_step: jax.Array,
-    gpu,
-) -> dict:
-    """Update detector states on GPU using only each detector's spatial slice.
-
-    Each detector's region is extracted from numpy (tiny), sent to GPU,
-    and the detector's ``.update()`` runs entirely on GPU.  Detector
-    states stay resident on GPU between time steps.
+def _update_detectors(
+    E_cpu, H_cpu, inv_permittivities_cpu, inv_permeabilities_cpu,
+    has_inv_permeabilities, inv_mu_scalar, detector_states, objects, time_step, gpu_device,
+):
+    """Update detector states. E_cpu, H_cpu are (Nx, Ny, Nz, 3).
+    inv_permeabilities_cpu can be None when has_inv_permeabilities is False.
     """
     for d in objects.forward_detectors:
-        is_on = bool(jax.device_get(d._is_on_at_time_step_arr[time_step]))
-        if not is_on:
+        if not bool(jax.device_get(d._is_on_at_time_step_arr[time_step])):
             continue
-
-        d_remap, E_gpu, eps_gpu, mu_gpu = _remap_to_gpu(
-            d, E_np, inv_eps_np, inv_mu_np,
-            mu_is_scalar, inv_mu_scalar, gpu,
+        d_remap, E_gpu, eps_gpu, mu_gpu = _remap_to_gpu_xfirst(
+            d, E_cpu, inv_permittivities_cpu, inv_permeabilities_cpu,
+            not has_inv_permeabilities, inv_mu_scalar, gpu_device,
         )
         sx, sy, sz = d.grid_slice
-        H_region = np.ascontiguousarray(
-            np.transpose(H_np[sz, :, sx, sy], (1, 2, 3, 0))
+        H_slice = H_cpu[sx, sy, sz, :]
+        H_gpu = jax.device_put(
+            jnp.asarray(np.ascontiguousarray(np.transpose(H_slice, (3, 0, 1, 2)))),
+            gpu_device,
         )
-        H_gpu = jax.device_put(jnp.asarray(H_region), gpu)
-
         detector_states[d.name] = d_remap.update(
-            time_step=time_step,
-            E=E_gpu,
-            H=H_gpu,
-            state=detector_states[d.name],
-            inv_permittivity=eps_gpu,
-            inv_permeability=mu_gpu,
+            time_step=time_step, E=E_gpu, H=H_gpu, state=detector_states[d.name],
+            inv_permittivity=eps_gpu, inv_permeability=mu_gpu,
         )
-
     return detector_states
+
+
+def tiled_fdtd(
+    arrays: ArrayContainer, 
+    objects: ObjectContainer, 
+    config: SimulationConfig, 
+    key: jax.Array, 
+    chunk_size: int | None = None,
+) -> SimulationState:
+
+    try:
+        cpu_device = jax.devices("cpu")[0]
+        gpu_device = jax.devices("gpu")[0]
+        print(f"Host Device: {cpu_device}")
+        print(f"Compute Device: {gpu_device}")
+    except IndexError:
+        print("Error: Could not find both CPU and GPU. Check your JAX installation.")
+        return
+
+    _, Nx, Ny, Nz = arrays.E.shape 
+    periodic_axes = get_periodic_axes(objects)
+    Cx = chunk_size if chunk_size is not None else 1
+
+    has_sources = bool(objects.sources)
+    has_detectors = bool(objects.forward_detectors)
+    inv_mu_val = arrays.inv_permeabilities
+    mu_is_scalar = inv_mu_val is None or not isinstance(inv_mu_val, jax.Array) or inv_mu_val.ndim == 0
+    inv_mu_scalar = (
+        1.0 if (mu_is_scalar and inv_mu_val is None)
+        else (float(jax.device_get(jnp.asarray(inv_mu_val))) if mu_is_scalar else None)
+    )
+    n_chunks = (Nx + Cx - 1) // Cx
+    tail_size = Nx - (n_chunks - 1) * Cx
+    x0_gpu_list = [jax.device_put(jnp.int32(ix * Cx), gpu_device) for ix in range(n_chunks)]
+    print(f"Chunk size: {Cx}")
+    print(f"Number of chunks: {n_chunks}")
+
+    b_pml, a_pml = _compute_pml_ab(arrays.alpha, arrays.kappa, arrays.sigma, config)
+
+    _print_timestamp()
+    print("Copying arrays to CPU memory...")
+
+    print("  Copying E to CPU memory...")
+    arrays.E.block_until_ready()
+    E_cpu = _memcpy_to_cpu_and_transpose(arrays.E, Nx, Ny, Nz)
+
+    E_halo_buffer_cpu = np.empty((tail_size + 1, Ny, Nz, 3), dtype=np.float32)
+    _check_cuda(
+        cudart.cudaHostRegister(E_halo_buffer_cpu.ctypes.data, E_halo_buffer_cpu.nbytes, CUDA_HOST_REGISTER_DEFAULT),
+        "cudaHostRegister (E_halo_buffer_cpu)"
+    )
+
+    E_chunk_gpu_main = jax.device_put(jnp.zeros((Cx, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+    E_chunk_gpu_tail = jax.device_put(jnp.zeros((tail_size, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+    E_halo_gpu_main = jax.device_put(jnp.zeros((Cx + 1, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+    E_halo_gpu_tail = jax.device_put(jnp.zeros((tail_size + 1, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+
+    print("  Copying H to CPU memory...")
+    arrays.H.block_until_ready()
+    H_cpu = _memcpy_to_cpu_and_transpose(arrays.H, Nx, Ny, Nz)
+
+    H_halo_buffer_cpu = np.empty((Cx + 1, Ny, Nz, 3), dtype=np.float32)
+    _check_cuda(
+        cudart.cudaHostRegister(H_halo_buffer_cpu.ctypes.data, H_halo_buffer_cpu.nbytes, CUDA_HOST_REGISTER_DEFAULT),
+        "cudaHostRegister (H_halo_buffer_cpu)"
+    )
+
+    H_chunk_gpu_main = jax.device_put(jnp.zeros((Cx, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+    H_chunk_gpu_tail = jax.device_put(jnp.zeros((tail_size, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+    H_halo_gpu_main = jax.device_put(jnp.zeros((Cx + 1, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+    H_halo_gpu_tail = jax.device_put(jnp.zeros((tail_size + 1, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+
+    print("  Copying inv_permittivities to CPU memory...")
+    arrays.inv_permittivities.block_until_ready()
+    inv_permittivities_cpu = _memcpy_to_cpu_and_transpose(arrays.inv_permittivities, Nx, Ny, Nz)
+
+    inv_permittivities_gpu_main = jax.device_put(jnp.zeros((Cx, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+    inv_permittivities_gpu_tail = jax.device_put(jnp.zeros((tail_size, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+
+    has_inv_permeabilities = False
+    if arrays.inv_permeabilities is not None and isinstance(arrays.inv_permeabilities, jax.Array):
+        print("  Copying inv_permeabilities to CPU memory...")
+        arrays.inv_permeabilities.block_until_ready()
+        inv_permeabilities_cpu = _memcpy_to_cpu_and_transpose(arrays.inv_permeabilities, Nx, Ny, Nz)
+        inv_permeabilities_gpu_main = jax.device_put(jnp.zeros((Cx, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+        inv_permeabilities_gpu_tail = jax.device_put(jnp.zeros((tail_size, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+        has_inv_permeabilities = True
+
+    has_electric_conductivity = False
+    if arrays.electric_conductivity is not None:
+        print("  Copying electric_conductivity to CPU memory...")
+        arrays.electric_conductivity.block_until_ready()
+        electric_conductivity_cpu = _memcpy_to_cpu_and_transpose(arrays.electric_conductivity, Nx, Ny, Nz)
+        electric_conductivity_gpu_main = jax.device_put(jnp.zeros((Cx, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+        electric_conductivity_gpu_tail = jax.device_put(jnp.zeros((tail_size, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+        has_electric_conductivity = True
+
+    has_magnetic_conductivity = False
+    if arrays.magnetic_conductivity is not None:
+        print("  Copying magnetic_conductivity to CPU memory...")
+        arrays.magnetic_conductivity.block_until_ready()
+        magnetic_conductivity_cpu = _memcpy_to_cpu_and_transpose(arrays.magnetic_conductivity, Nx, Ny, Nz)
+        magnetic_conductivity_gpu_main = jax.device_put(jnp.zeros((Cx, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+        magnetic_conductivity_gpu_tail = jax.device_put(jnp.zeros((tail_size, Ny, Nz, 3), dtype=jnp.float32), gpu_device)
+        has_magnetic_conductivity = True
+
+    new_arrays = ArrayContainer(
+        E=None,
+        H=None,
+        psi_E=arrays.psi_E,
+        psi_H=arrays.psi_H,
+        alpha=arrays.alpha,
+        kappa=arrays.kappa,
+        sigma=arrays.sigma,
+        inv_permittivities=None,
+        inv_permeabilities=arrays.inv_permeabilities if not has_inv_permeabilities else None,
+        detector_states=arrays.detector_states,
+        recording_state=arrays.recording_state,
+        electric_conductivity=None,
+        magnetic_conductivity=None,
+    )
+    b_pml, a_pml = _compute_pml_ab(new_arrays.alpha, new_arrays.kappa, new_arrays.sigma, config)
+    kappa_Ex = new_arrays.kappa[0]
+    kappa_Ey = new_arrays.kappa[1]
+    kappa_Ez = new_arrays.kappa[2]
+    kappa_Hx = new_arrays.kappa[3]
+    kappa_Hy = new_arrays.kappa[4]
+    kappa_Hz = new_arrays.kappa[5]
+    psi_E = new_arrays.psi_E
+    psi_H = new_arrays.psi_H
+    detector_states = new_arrays.detector_states
+
+    del arrays
+    gc.collect()
+
+    _print_timestamp()
+    print("Arrays copied to CPU memory")
+
+    _print_timestamp()
+    print(f"Time loop starting")
+
+    for t in range(config.time_steps_total):
+        time_step = jax.device_put(jnp.int32(t), gpu_device)
+        if t % 50 == 0:
+            _print_timestamp()
+            print(f"Time step {t} of {config.time_steps_total}")
+
+        # ==============================================================
+        # Phase 1 — E update 
+        # ==============================================================
+        for ix in range(n_chunks):
+            x0 = ix * Cx
+            x1 = min((ix + 1) * Cx, Nx)
+            actual_chunk_size = x1-x0
+            x0_gpu = x0_gpu_list[ix]
+
+            if actual_chunk_size == Cx:
+                E_chunk_gpu = E_chunk_gpu_main
+                inv_eps_chunk_gpu = inv_permittivities_gpu_main
+                if has_electric_conductivity:
+                    sigma_E_chunk_gpu = electric_conductivity_gpu_main
+                H_halo_gpu = H_halo_gpu_main
+            else:
+                E_chunk_gpu = E_chunk_gpu_tail
+                inv_eps_chunk_gpu = inv_permittivities_gpu_tail
+                if has_electric_conductivity:
+                    sigma_E_chunk_gpu = electric_conductivity_gpu_tail
+                H_halo_gpu = H_halo_gpu_tail
+            
+            E_chunk_cpu = E_cpu[x0:x1, :, :, :]
+            _memcpy_cpu_to_gpu(E_chunk_cpu, E_chunk_gpu)
+            E_chunk_gpu.block_until_ready()
+            inv_eps_chunk_cpu = inv_permittivities_cpu[x0:x1, :, :, :]
+            _memcpy_cpu_to_gpu(inv_eps_chunk_cpu, inv_eps_chunk_gpu)
+            inv_eps_chunk_gpu.block_until_ready()
+            if has_electric_conductivity:
+                sigma_E_chunk_cpu = electric_conductivity_cpu[x0:x1, :, :, :]
+                _memcpy_cpu_to_gpu(sigma_E_chunk_cpu, sigma_E_chunk_gpu)
+                sigma_E_chunk_gpu.block_until_ready()
+            else:
+                sigma_E_chunk_cpu = None
+                sigma_E_chunk_gpu = None
+
+            if x0 > 0:
+                H_halo_cpu = H_cpu[x0-1:x1, :, :, :]
+            else:
+                if periodic_axes[0]:
+                    H_halo_buffer_cpu[0, :, :, :] = H_cpu[-1, :, :, :]
+                else:
+                    H_halo_buffer_cpu[0, :, :, :] = 0
+                H_halo_buffer_cpu[1:, :, :, :] = H_cpu[x0:x1, :, :, :]
+                H_halo_cpu = H_halo_buffer_cpu
+            _memcpy_cpu_to_gpu(H_halo_cpu, H_halo_gpu)
+            H_halo_gpu.block_until_ready() 
+
+            E_chunk_gpu, psi_E = _update_E_chunk(
+                E_chunk_gpu,
+                H_halo_gpu,
+                inv_eps_chunk_gpu,
+                sigma_E_chunk_gpu,
+                psi_E,
+                config.courant_number,
+                a_pml, b_pml,
+                kappa_Ex, kappa_Ey, kappa_Ez,
+                periodic_axes,
+                x0_gpu, 
+                actual_chunk_size, 
+                Nx,
+            )
+            E_chunk_gpu.block_until_ready()
+            jax.block_until_ready(psi_E)
+
+            _memcpy_gpu_to_cpu(E_chunk_gpu, E_chunk_cpu)
+
+            if actual_chunk_size == Cx:
+                E_chunk_gpu_main = E_chunk_gpu
+                inv_eps_chunk_gpu_main = inv_eps_chunk_gpu
+                if has_electric_conductivity:
+                    sigma_E_chunk_gpu_main = sigma_E_chunk_gpu
+                H_halo_gpu_main = H_halo_gpu
+            else:
+                E_chunk_gpu_tail = E_chunk_gpu
+                inv_eps_chunk_gpu_tail = inv_eps_chunk_gpu
+                if has_electric_conductivity:
+                    sigma_E_chunk_gpu_tail = sigma_E_chunk_gpu
+                H_halo_gpu_tail = H_halo_gpu
+
+            del H_halo_cpu
+            del E_chunk_cpu
+            del inv_eps_chunk_cpu
+            del sigma_E_chunk_cpu
+
+        # ==============================================================
+        # Phase 1a — E sources
+        # ==============================================================
+        if has_sources:
+            _apply_sources_E(
+                E_cpu, inv_permittivities_cpu,
+                inv_permeabilities_cpu if has_inv_permeabilities else None,
+                has_inv_permeabilities, inv_mu_scalar, objects, time_step, gpu_device,
+            )
+
+        # ==============================================================
+        # Phase 2 — H update 
+        # ==============================================================
+        for ix in range(n_chunks):
+            x0 = ix * Cx
+            x1 = min((ix + 1) * Cx, Nx)
+            actual_chunk_size = x1-x0
+            x0_gpu = x0_gpu_list[ix]
+
+            if actual_chunk_size == Cx:
+                H_chunk_gpu = H_chunk_gpu_main
+                if has_inv_permeabilities:
+                    inv_mu_chunk_gpu = inv_permeabilities_gpu_main
+                if has_magnetic_conductivity:
+                    sigma_H_chunk_gpu = magnetic_conductivity_gpu_main
+                E_halo_gpu = E_halo_gpu_main
+            else:
+                H_chunk_gpu = H_chunk_gpu_tail
+                if has_inv_permeabilities:
+                    inv_mu_chunk_gpu = inv_permeabilities_gpu_tail
+                if has_magnetic_conductivity:
+                    sigma_H_chunk_gpu = magnetic_conductivity_gpu_tail
+                E_halo_gpu = E_halo_gpu_tail
+
+            H_chunk_cpu = H_cpu[x0:x1, :, :, :]
+            _memcpy_cpu_to_gpu(H_chunk_cpu, H_chunk_gpu)
+            H_chunk_gpu.block_until_ready()
+            if has_inv_permeabilities:
+                inv_mu_chunk_cpu = inv_permeabilities_cpu[x0:x1, :, :, :]
+                _memcpy_cpu_to_gpu(inv_mu_chunk_cpu, inv_mu_chunk_gpu)
+                inv_mu_chunk_gpu.block_until_ready()
+            else:
+                inv_mu_chunk_cpu = None
+                inv_mu_chunk_gpu = new_arrays.inv_permeabilities
+            if has_magnetic_conductivity:
+                sigma_H_chunk_cpu = magnetic_conductivity_cpu[x0:x1, :, :, :]
+                _memcpy_cpu_to_gpu(sigma_H_chunk_cpu, sigma_H_chunk_gpu)
+                sigma_H_chunk_gpu.block_until_ready()
+            else:
+                sigma_H_chunk_cpu = None
+                sigma_H_chunk_gpu = None
+
+            if x1 < Nx:
+                E_halo_cpu = E_cpu[x0:x1+1, :, :, :]
+            else:
+                if periodic_axes[0]:
+                    E_halo_buffer_cpu[-1, :, :, :] = E_cpu[0, :, :, :]
+                else:
+                    E_halo_buffer_cpu[-1, :, :, :] = 0
+                E_halo_buffer_cpu[0:-1, :, :, :] = E_cpu[x0:x1, :, :, :]
+                E_halo_cpu = E_halo_buffer_cpu
+            _memcpy_cpu_to_gpu(E_halo_cpu, E_halo_gpu)
+            E_halo_gpu.block_until_ready()
+
+            H_chunk_gpu, psi_H = _update_H_chunk(
+                H_chunk_gpu,
+                E_halo_gpu,
+                inv_mu_chunk_gpu,
+                sigma_H_chunk_gpu,
+                psi_H,
+                config.courant_number,
+                a_pml, b_pml,
+                kappa_Hx, kappa_Hy, kappa_Hz,
+                periodic_axes,
+                x0_gpu, 
+                actual_chunk_size, 
+                Nx,
+            )
+            H_chunk_gpu.block_until_ready()
+            jax.block_until_ready(psi_H)
+
+            _memcpy_gpu_to_cpu(H_chunk_gpu, H_chunk_cpu)
+
+            if actual_chunk_size == Cx:
+                H_chunk_gpu_main = H_chunk_gpu
+                if has_inv_permeabilities:
+                    inv_mu_chunk_gpu_main = inv_mu_chunk_gpu
+                if has_magnetic_conductivity:
+                    sigma_H_chunk_gpu_main = sigma_H_chunk_gpu
+                E_halo_gpu_main = E_halo_gpu
+            else:
+                H_chunk_gpu_tail = H_chunk_gpu
+                if has_inv_permeabilities:
+                    inv_mu_chunk_gpu_tail = inv_mu_chunk_gpu
+                if has_magnetic_conductivity:
+                    sigma_H_chunk_gpu_tail = sigma_H_chunk_gpu
+                E_halo_gpu_tail = E_halo_gpu
+
+            del E_halo_cpu
+            del H_chunk_cpu
+            del sigma_H_chunk_cpu
+
+        # ==============================================================
+        # Phase 2a — H sources
+        # ==============================================================
+        if has_sources:
+            _apply_sources_H(
+                H_cpu, inv_permittivities_cpu,
+                inv_permeabilities_cpu if has_inv_permeabilities else None,
+                has_inv_permeabilities, inv_mu_scalar, objects, time_step, gpu_device,
+            )
+
+        # ==============================================================
+        # Phase 3 — Detectors
+        # ==============================================================
+        if has_detectors:
+            detector_states = _update_detectors(
+                E_cpu, H_cpu, inv_permittivities_cpu,
+                inv_permeabilities_cpu if has_inv_permeabilities else None,
+                has_inv_permeabilities, inv_mu_scalar, detector_states,
+                objects, time_step, gpu_device,
+            )
+
+        #if t >= 10: break
+
+    _print_timestamp()
+    print(f"Time loop completed")
+
+    # Delete GPU arrays
+    E_chunk_gpu_main.delete()
+    if Nx % Cx != 0: E_chunk_gpu_tail.delete()
+    inv_eps_chunk_gpu_main.delete()
+    if Nx % Cx != 0: inv_eps_chunk_gpu_tail.delete()
+    if has_electric_conductivity:
+        sigma_E_chunk_gpu_main.delete()
+        if Nx % Cx != 0: sigma_E_chunk_gpu_tail.delete()
+    H_chunk_gpu_main.delete()
+    if Nx % Cx != 0: H_chunk_gpu_tail.delete()
+    if has_inv_permeabilities:
+        inv_mu_chunk_gpu_main.delete()
+        if Nx % Cx != 0: inv_mu_chunk_gpu_tail.delete()
+    if has_magnetic_conductivity:
+        sigma_H_chunk_gpu_main.delete()
+        if Nx % Cx != 0: sigma_H_chunk_gpu_tail.delete()
+    E_halo_gpu_main.delete()
+    if Nx % Cx != 0: E_halo_gpu_tail.delete()
+    H_halo_gpu_main.delete()
+    if Nx % Cx != 0: H_halo_gpu_tail.delete()
+
+    gc.collect()
+
+    # Reconstruct ArrayContainer — convert from (Nx, Ny, Nz, 3) to (3, Nx, Ny, Nz)
+    final_inv_eps = jnp.asarray(np.ascontiguousarray(np.transpose(inv_permittivities_cpu, (3, 0, 1, 2))))
+    final_sigma_E = (
+        jnp.asarray(np.ascontiguousarray(np.transpose(electric_conductivity_cpu, (3, 0, 1, 2))))
+        if has_electric_conductivity else None
+    )
+    final_sigma_H = (
+        jnp.asarray(np.ascontiguousarray(np.transpose(magnetic_conductivity_cpu, (3, 0, 1, 2))))
+        if has_magnetic_conductivity else None
+    )
+    final_inv_mu = (
+        jnp.asarray(inv_mu_scalar)
+        if mu_is_scalar
+        else jnp.asarray(np.ascontiguousarray(np.transpose(inv_permeabilities_cpu, (3, 0, 1, 2))))
+    )
+
+    out = ArrayContainer(
+        E=None,
+        H=None,
+        psi_E=None,
+        psi_H=None,
+        alpha=None,
+        kappa=None,
+        sigma=None,
+        inv_permittivities=final_inv_eps,
+        inv_permeabilities=final_inv_mu,
+        detector_states=detector_states,
+        recording_state=new_arrays.recording_state,
+        electric_conductivity=final_sigma_E,
+        magnetic_conductivity=final_sigma_H,
+    )
+
+    # Unregister CPU memory
+    _unregister_cpu_memory(E_cpu)
+    _unregister_cpu_memory(E_halo_buffer_cpu)
+    _unregister_cpu_memory(H_cpu)
+    _unregister_cpu_memory(H_halo_buffer_cpu)
+    _unregister_cpu_memory(inv_permittivities_cpu)
+    if has_inv_permeabilities:
+        _unregister_cpu_memory(inv_permeabilities_cpu)
+    if has_electric_conductivity:
+        _unregister_cpu_memory(electric_conductivity_cpu)
+    if has_magnetic_conductivity:
+        _unregister_cpu_memory(magnetic_conductivity_cpu)
+
+    
+    return (jnp.asarray(t, dtype=jnp.int32), out)
