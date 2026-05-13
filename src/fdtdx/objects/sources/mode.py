@@ -86,6 +86,22 @@ class ModePlaneSource(TFSFPlaneSource):
             effective_index=jnp.real(eff_index),
         )
 
+        # For ``direction="-"`` the TFSF boundary lies on the -propagation_axis
+        # side of the source plane, so the H-field corrections are applied at
+        # array index ``src - 1`` (see ``TFSFPlaneSource.grid_slice_H_correction``).
+        # ``calculate_time_offset_yee`` evaluates time offsets at the natural Yee
+        # positions (transverse H components carry a +0.5 yee offset along the
+        # propagation axis), which gives the right answer for direction "+",
+        # but for direction "-" we actually want the time offset at the -0.5
+        # offset position. For an axis-aligned (non-tilted) plane wave the
+        # propagation-axis contribution is the only contribution to these
+        # offsets, so flipping their sign yields the time offsets we need.
+        if self.direction == "-":
+            h_axis = self.horizontal_axis
+            v_axis = self.vertical_axis
+            time_offset_H = time_offset_H.at[h_axis].set(-time_offset_H[h_axis])
+            time_offset_H = time_offset_H.at[v_axis].set(-time_offset_H[v_axis])
+
         self = self.aset("_time_offset_E", time_offset_E, create_new_ok=True)
         self = self.aset("_time_offset_H", time_offset_H, create_new_ok=True)
 

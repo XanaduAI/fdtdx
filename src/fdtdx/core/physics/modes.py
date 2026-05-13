@@ -262,6 +262,21 @@ def compute_mode(
 
     mode_E_norm, mode_H_norm = normalize_by_poynting_flux(mode_E, mode_H, axis=propagation_axis)
 
+    # Eigenvectors are only determined up to a global complex phase, and the
+    # tidy3d mode solver does not pin this phase consistently across propagation
+    # directions: for ``direction="-"`` the returned mode is typically rotated
+    # by ~90 degrees relative to ``direction="+"`` (transverse components become
+    # purely imaginary while longitudinal components become real). Callers that
+    # take ``jnp.real`` of the mode would then see a zero field, so we rotate
+    # the global phase here such that the dominant E-field component is real
+    # and positive.
+    flat_E = mode_E_norm.reshape(-1)
+    dominant_idx = jnp.argmax(jnp.abs(flat_E))
+    phase = jnp.angle(flat_E[dominant_idx])
+    phase_factor = jnp.exp(-1j * phase)
+    mode_E_norm = mode_E_norm * phase_factor
+    mode_H_norm = mode_H_norm * phase_factor
+
     return mode_E_norm, mode_H_norm, eff_idx
 
 

@@ -13,8 +13,23 @@ from fdtdx.objects.sources.source import DirectionalPlaneSourceBase
 class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
     """
     Total-Field/Scattered-Field (TFSF) implementation of a source.
-    The boundary between the scattered field and total field is at a
-    positive offset of 0.25 in the yee grid in the axis of propagation.
+
+    The TFSF boundary separates the simulation domain into a Total-Field (TF)
+    region (incident + scattered fields) and a Scattered-Field (SF) region
+    (scattered fields only). Its orientation along the propagation axis
+    depends on the source ``direction``:
+
+    - For ``direction="+"`` the boundary is at a yee-grid offset of ``+0.25``
+      from the source plane. The TF region lies on the ``+propagation_axis``
+      side of the source and the SF region on the ``-propagation_axis`` side.
+    - For ``direction="-"`` the boundary is at a yee-grid offset of ``-0.25``
+      from the source plane. The TF region lies on the ``-propagation_axis``
+      side of the source and the SF region on the ``+propagation_axis`` side.
+
+    With this convention the injected wave always travels into a non-trivial
+    Total-Field region (where the device under test is expected to live) and
+    not into a thin slice between the source and the boundary, regardless of
+    propagation direction.
     """
 
     #: the azimuth angle
@@ -81,6 +96,28 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
             float: Maximum horizontal offset in grid points.
         """
         return self.max_horizontal_offset / self._config.resolution
+
+    @property
+    def grid_slice_H_correction(self) -> tuple[slice, slice, slice]:
+        """Grid slice at which TFSF H-field corrections are applied.
+
+        For ``direction="+"`` the closest H-field components on the TF side of
+        the boundary share the same array index as the source plane (since the
+        transverse H components have a ``+0.5`` yee offset along the
+        propagation axis). For ``direction="-"`` the boundary lies on the
+        ``-propagation_axis`` side of the source plane and the relevant H
+        components live one cell back along the propagation axis (at array
+        index ``src - 1``, i.e., physical position ``src - 0.5``).
+
+        Returns:
+            tuple[slice, slice, slice]: Grid slice for the H-field corrections.
+        """
+        slices = list(self.grid_slice)
+        if self.direction == "-":
+            prop_axis = self.propagation_axis
+            s = slices[prop_axis]
+            slices[prop_axis] = slice(s.start - 1, s.stop - 1, s.step)
+        return slices[0], slices[1], slices[2]
 
     def _get_azimuth_elevation(
         self,
@@ -252,6 +289,11 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
         delta_t = self._config.time_step_duration
         c = self._config.courant_number
 
+        # H corrections are applied to the H components on the TF side of the
+        # TFSF boundary. Their location depends on the propagation direction
+        # (see ``grid_slice_H_correction``).
+        h_correction_slice = self.grid_slice_H_correction
+
         # Determine if fully anisotropic
         is_fully_anisotropic = (
             isinstance(inv_permeabilities, jax.Array)
@@ -260,8 +302,9 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
         )
 
         if isinstance(inv_permeabilities, jax.Array) and inv_permeabilities.ndim > 0:
-            # Slice the permeability tensor at the TFSF boundary, shape: (num_components, Nx, Ny, Nz)
-            inv_permeability_slice = inv_permeabilities[:, *self.grid_slice]
+            # Slice the permeability tensor at the TFSF H correction location,
+            # shape: (num_components, Nx, Ny, Nz)
+            inv_permeability_slice = inv_permeabilities[:, *h_correction_slice]
         else:
             inv_permeability_slice = inv_permeabilities
 
@@ -300,11 +343,11 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
             # update uses +E_h, we have to add update, resulting in +E_h
             # update uses -E_v, we have to add update, resulting in -E_v
             H_p_correction = c * (get_inv_mu(p_axis, h_axis) * (-E_v_inc) + get_inv_mu(p_axis, v_axis) * (+E_h_inc))
-            H = H.at[p_axis, *self.grid_slice].add(sign * H_p_correction)
+            H = H.at[p_axis, *h_correction_slice].add(sign * H_p_correction)
             H_h_correction = c * (get_inv_mu(h_axis, h_axis) * (-E_v_inc) + get_inv_mu(h_axis, v_axis) * (+E_h_inc))
-            H = H.at[h_axis, *self.grid_slice].add(sign * H_h_correction)
+            H = H.at[h_axis, *h_correction_slice].add(sign * H_h_correction)
             H_v_correction = c * (get_inv_mu(v_axis, h_axis) * (-E_v_inc) + get_inv_mu(v_axis, v_axis) * (+E_h_inc))
-            H = H.at[v_axis, *self.grid_slice].add(sign * H_v_correction)
+            H = H.at[v_axis, *h_correction_slice].add(sign * H_v_correction)
 
             return H
 
@@ -328,8 +371,8 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
             E_v_inc = jax.lax.stop_gradient(E_v_inc)
 
             # update used +E_h, we have to add update, resulting in +E_h
-            H = H.at[v_axis, *self.grid_slice].add(sign * E_h_inc)
+            H = H.at[v_axis, *h_correction_slice].add(sign * E_h_inc)
             # update used -E_v, we have to add update, resulting in -E_v
-            H = H.at[h_axis, *self.grid_slice].add(-sign * E_v_inc)
+            H = H.at[h_axis, *h_correction_slice].add(-sign * E_v_inc)
 
             return H
