@@ -24,6 +24,7 @@ def interpolate_fields(
     E_field: jax.Array,
     H_field: jax.Array,
     periodic_axes: tuple[bool, bool, bool] = (False, False, False),
+    axis: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Interpolates E and H fields onto E_z in a FDTD grid with PEC/periodic boundary conditions."""
     E_field = pad_fields(E_field, periodic_axes)
@@ -32,6 +33,7 @@ def interpolate_fields(
     E_x, E_y, E_z = E_field[0], E_field[1], E_field[2]
     H_x, H_y, H_z = H_field[0], H_field[1], H_field[2]
 
+    """
     E_x = (E_x[1:-1,1:-1,1:-1] + E_x[:-2,1:-1,1:-1] + E_x[1:-1,1:-1,2:] + E_x[:-2,1:-1,2:]) / 4.0
     E_y = (E_y[1:-1,1:-1,1:-1] + E_y[1:-1,:-2,1:-1] + E_y[1:-1,1:-1,2:] + E_y[1:-1,:-2,2:]) / 4.0
     E_z = E_z[1:-1, 1:-1, 1:-1]
@@ -39,6 +41,34 @@ def interpolate_fields(
     H_y = (H_y[1:-1,1:-1,1:-1] + H_y[:-2,1:-1,1:-1]) / 2.0
     H_z = (H_z[1:-1,1:-1,1:-1] + H_z[:-2,1:-1,1:-1] + H_z[1:-1,:-2,1:-1] + H_z[:-2,:-2,1:-1]
         + H_z[1:-1,1:-1,2:] + H_z[:-2,1:-1,2:] + H_z[1:-1,:-2,2:] + H_z[:-2,:-2,2:]) / 8.0
+    """
+
+    if axis == 0:
+        E_y = E_y[1:-1,1:-1,1:-1]
+        E_z = E_z[1:-1,1:-1,1:-1]
+        H_x = H_x[1:-1,1:-1,1:-1]
+
+        E_x = (E_x[1:-1,1:-1,1:-1] + E_x[:-2,1:-1,1:-1]) / 2.0
+        H_y = (H_y[1:-1,1:-1,1:-1] + H_y[:-2,1:-1,1:-1]) / 2.0
+        H_z = (H_z[1:-1,1:-1,1:-1] + H_z[:-2,1:-1,1:-1]) / 2.0
+
+    elif axis == 1:
+        E_x = E_x[1:-1,1:-1,1:-1]
+        E_z = E_z[1:-1,1:-1,1:-1]
+        H_y = H_y[1:-1,1:-1,1:-1]
+
+        E_y = (E_y[1:-1,1:-1,1:-1] + E_y[1:-1,:-2,1:-1]) / 2.0
+        H_x = (H_x[1:-1,1:-1,1:-1] + H_x[1:-1,:-2,1:-1]) / 2.0
+        H_z = (H_z[1:-1,1:-1,1:-1] + H_z[1:-1,:-2,1:-1]) / 2.0
+
+    else: # axis == 2
+        E_x = E_x[1:-1,1:-1,1:-1]
+        E_y = E_y[1:-1,1:-1,1:-1]
+        H_z = H_z[1:-1,1:-1,1:-1]
+
+        E_z = (E_z[1:-1,1:-1,1:-1] + E_z[1:-1,1:-1,:-2]) / 2.0
+        H_x = (H_x[1:-1,1:-1,1:-1] + H_x[1:-1,1:-1,:-2]) / 2.0
+        H_y = (H_y[1:-1,1:-1,1:-1] + H_y[1:-1,1:-1,:-2]) / 2.0
 
     E_interp = jnp.stack([E_x, E_y, E_z], axis=0)
     H_interp = jnp.stack([H_x, H_y, H_z], axis=0)

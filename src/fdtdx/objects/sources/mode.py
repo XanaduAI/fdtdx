@@ -26,6 +26,17 @@ class ModePlaneSource(TFSFPlaneSource):
 
     _neff: jax.Array = private_field()  # not required for sim, used for inspection
 
+    def _rotate_onto_real_axis(
+        self: Self,
+        mode_E: jax.Array,
+        mode_H: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        transverse_axes = jnp.asarray([ax for ax in range(3) if ax != self.propagation_axis])
+        gauge = jnp.sum(mode_E[transverse_axes] ** 2)
+        # jnp.angle(0) == 0, so a degenerate gauge falls back to the untouched real part
+        rotation = jnp.exp(-0.5j * jnp.angle(gauge))
+        return jnp.real(rotation * mode_E), jnp.real(rotation * mode_H)
+
     def apply(
         self: Self,
         key: jax.Array,
@@ -63,7 +74,7 @@ class ModePlaneSource(TFSFPlaneSource):
             mode_index=self.mode_index,
             filter_pol=self.filter_pol,
         )
-        mode_E, mode_H = jnp.real(mode_E), jnp.real(mode_H)
+        mode_E, mode_H = self._rotate_onto_real_axis(mode_E, mode_H)
 
         self = self.aset("_E", mode_E, create_new_ok=True)
         self = self.aset("_H", mode_H, create_new_ok=True)

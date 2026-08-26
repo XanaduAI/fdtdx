@@ -602,11 +602,22 @@ def update_detector_states(
         ArrayContainer: Updated ArrayContainer with new detector states
     """
     periodic_axes = get_periodic_axes(objects)
-    interpolated_E, interpolated_H = interpolate_fields(
-        E_field=arrays.E,
-        H_field=(H_prev + arrays.H) / 2,
-        periodic_axes=periodic_axes,
-    )
+    to_update = objects.backward_detectors if inverse else objects.forward_detectors
+
+    # A monitor's thinnest axis is the direction it measures propagation along, and
+    # interpolate_fields averages along that axis only, so the averaging never crosses
+    # the waveguide walls. One interpolation per distinct axis in use.
+    H_avg = (H_prev + arrays.H) / 2
+    axis_of = {d.name: min(range(3), key=lambda a: d.grid_shape[a]) for d in to_update}
+    interpolated = {
+        axis: interpolate_fields(
+            E_field=arrays.E,
+            H_field=H_avg,
+            periodic_axes=periodic_axes,
+            axis=axis,
+        )
+        for axis in set(axis_of.values())
+    }
 
     def helper_fn(E_input, H_input, detector: Detector):
         return detector.update(
@@ -619,8 +630,8 @@ def update_detector_states(
         )
 
     state = arrays.detector_states
-    to_update = objects.backward_detectors if inverse else objects.forward_detectors
     for d in to_update:
+        interpolated_E, interpolated_H = interpolated[axis_of[d.name]]
         state[d.name] = jax.lax.cond(
             d._is_on_at_time_step_arr[time_step],
             helper_fn,
