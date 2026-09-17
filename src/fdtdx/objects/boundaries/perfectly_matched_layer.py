@@ -177,19 +177,25 @@ class PerfectlyMatchedLayer(BaseBoundary):
         assert self.sigma_end is not None, "sigma_end   should be set by __post_init__"
         assert self.sigma_order is not None, "sigma_order should be set by __post_init__"
 
-        dtype = self._config.dtype
+        dtype = self._config.material_dtype
 
         sigma_E_1d, sigma_H_1d = self._compute_pml_profile_1d(
-            value_start=self.sigma_start, value_end=self.sigma_end,
-            order=self.sigma_order, dtype=dtype,
+            value_start=self.sigma_start,
+            value_end=self.sigma_end,
+            order=self.sigma_order,
+            dtype=dtype,
         )
         kappa_E_1d, kappa_H_1d = self._compute_pml_profile_1d(
-            value_start=self.kappa_start, value_end=self.kappa_end,
-            order=self.kappa_order, dtype=dtype,
+            value_start=self.kappa_start,
+            value_end=self.kappa_end,
+            order=self.kappa_order,
+            dtype=dtype,
         )
         alpha_E_1d, alpha_H_1d = self._compute_pml_profile_1d(
-            value_start=self.alpha_start, value_end=self.alpha_end,
-            order=self.alpha_order, dtype=dtype,
+            value_start=self.alpha_start,
+            value_end=self.alpha_end,
+            order=self.alpha_order,
+            dtype=dtype,
         )
 
         axis_slice = self.grid_slice[self.axis]

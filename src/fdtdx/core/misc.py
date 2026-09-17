@@ -241,7 +241,7 @@ def index_by_slice_take_1d(
     start, stop, step = slice.indices(arr.shape[axis])
     if start == 0 and stop == arr.shape[axis] and step == 1:
         return arr
-    indices = jnp.arange(start, stop, step)
+    indices = jnp.arange(start, stop, step, dtype=jnp.int32)
     if len(indices) == 0:
         raise Exception(f"Invalid slice: {slice}")
     arr = jnp.take(arr, indices, axis=axis, unique_indices=True, indices_are_sorted=True)
@@ -271,7 +271,7 @@ def index_by_slice_take(
         start, stop, step = s.indices(arr.shape[axis])
         if start == 0 and stop == arr.shape[axis] and step == 1:
             continue
-        indices = jnp.arange(start, stop, step)
+        indices = jnp.arange(start, stop, step, dtype=jnp.int32)
         if len(indices) == 0:
             raise Exception(f"Invalid slice: {s}")
         arr = jnp.take(arr, indices, axis=axis, unique_indices=True, indices_are_sorted=True)
@@ -506,8 +506,9 @@ def expand_to_3x3(arr: jax.Array | float | None) -> jax.Array | None:
     if arr is None:
         return None
 
-    # Convert to array to handle scalars and ensure we have a jax array
-    arr = jnp.asarray(arr)
+    # A raw python float (e.g. the inv_mu = 1.0 sentinel) would take jax's default
+    # dtype under x64; an already-typed array passes through with its own.
+    arr = arr if isinstance(arr, jax.Array) else jnp.asarray(arr, dtype=jnp.float32)
 
     # Handle scalar case (e.g., inv_mu = 1.0 for non-magnetic materials)
     if arr.ndim == 0:

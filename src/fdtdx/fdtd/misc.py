@@ -89,8 +89,10 @@ def compute_anisotropic_update_matrices(
         tuple[jax.Array, jax.Array]: A and B matrices
     """
 
-    M1 = jnp.eye(3)[:, :, None, None, None]
-    M2 = jnp.eye(3)[:, :, None, None, None]
+    # Pinned to the material tensor: a bare jnp.eye(3) would take float64 under x64
+    # and promote the full-grid A/B tensors with it.
+    M1 = jnp.eye(3, dtype=inv_material_prop.dtype)[:, :, None, None, None]
+    M2 = jnp.eye(3, dtype=inv_material_prop.dtype)[:, :, None, None, None]
     if sigma is not None:
         factor = c * eta_factor / 2 * jnp.einsum("ijxyz,jkxyz->ikxyz", inv_material_prop, sigma)
         M1 += factor
@@ -120,8 +122,8 @@ def compute_anisotropic_update_matrices_reverse(
     Returns:
         tuple[jax.Array, jax.Array]: A and B matrices
     """
-    M1 = jnp.eye(3)[:, :, None, None, None]
-    M2 = jnp.eye(3)[:, :, None, None, None]
+    M1 = jnp.eye(3, dtype=inv_material_prop.dtype)[:, :, None, None, None]
+    M2 = jnp.eye(3, dtype=inv_material_prop.dtype)[:, :, None, None, None]
     if sigma is not None:
         factor = c * eta_factor / 2 * jnp.einsum("ijxyz,jkxyz->ikxyz", inv_material_prop, sigma)
         M1 += factor

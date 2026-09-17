@@ -57,8 +57,13 @@ class SimulationConfig(TreeClass):
     #: Computation backend ('gpu', 'tpu', 'cpu' or 'METAL'). Defaults to "gpu".
     backend: BackendOption = frozen_field(default="gpu")
 
-    #:  Data type for numerical computations. Defaults to jnp.float32.
+    #: Dtype of the accumulators: E/H fields, PML psi, recorder boundary copies.
+    #: float64 (needs jax x64) keeps per-step corrections below one float32 ULP.
     dtype: jnp.dtype = frozen_field(default=jnp.float32)
+
+    #: Dtype of the material arrays (permittivity, permeability, conductivity, PML
+    #: profiles). Read fresh each step, not accumulated, so float32 costs no accuracy.
+    material_dtype: jnp.dtype = frozen_field(default=jnp.float32)
 
     #: Safety factor for the Courant condition (default: 0.99).
     courant_factor: float = frozen_field(default=0.99)

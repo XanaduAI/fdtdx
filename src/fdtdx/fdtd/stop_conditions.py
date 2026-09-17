@@ -289,8 +289,11 @@ class DetectorConvergenceCondition(StoppingCondition):
             start_ref = jnp.clip(start_ref, 0, config.time_steps_total - self.prev_periods * self._spp)
             start_last = jnp.clip(start_last, 0, config.time_steps_total - self._spp)
 
-            ref_2d = jax.lax.dynamic_slice(readings, (start_ref, 0), (self.prev_periods * self._spp, 1))
-            last_2d = jax.lax.dynamic_slice(readings, (start_last, 0), (self._spp, 1))
+            # dynamic_slice needs all indices at one dtype; a bare 0 literal is int64
+            # under x64 and int32 otherwise, so pin them.
+            zero = jnp.int32(0)
+            ref_2d = jax.lax.dynamic_slice(readings, (jnp.int32(start_ref), zero), (self.prev_periods * self._spp, 1))
+            last_2d = jax.lax.dynamic_slice(readings, (jnp.int32(start_last), zero), (self._spp, 1))
 
             readings_ref = jnp.squeeze(ref_2d, axis=1)  # (k*spp,)
             readings_last = jnp.squeeze(last_2d, axis=1)  # (spp,)

@@ -177,7 +177,8 @@ def apply_params(
                 device.materials,
                 isotropic=isotropic,
                 diagonally_anisotropic=diagonally_anisotropic,
-            )
+            ),
+            dtype=arrays.inv_permittivities.dtype,
         )  # shape: (num_materials, num_components)
         if isotropic or diagonally_anisotropic:
             inv_allowed = (1.0 / allowed_perm_array)[:, :, None, None, None]
@@ -268,6 +269,7 @@ def _init_arrays(
     axis_lengths = (Nx, Ny, Nz)
     pml_thicknesses = [[0, 0], [0, 0], [0, 0]]  # [min, max] per axis
     from fdtdx.objects.boundaries.perfectly_matched_layer import PerfectlyMatchedLayer as _PML
+
     for boundary in objects.pml_objects:
         if isinstance(boundary, _PML):
             axis = boundary.axis
@@ -285,9 +287,9 @@ def _init_arrays(
         axis = i % 3
         shape = [1, 1, 1]
         shape[axis] = axis_lengths[axis]
-        alpha_list.append(jnp.zeros(shape, dtype=config.dtype))
-        kappa_list.append(jnp.ones(shape, dtype=config.dtype))
-        sigma_list.append(jnp.zeros(shape, dtype=config.dtype))
+        alpha_list.append(jnp.zeros(shape, dtype=config.material_dtype))
+        kappa_list.append(jnp.ones(shape, dtype=config.material_dtype))
+        sigma_list.append(jnp.zeros(shape, dtype=config.material_dtype))
 
     # Create sparse psi_E and psi_H (only PML boundary slabs)
     # Psi component axis mapping: [xy,xz,yz,yx,zx,zy] -> PML axes [1,2,2,0,0,1]
@@ -302,10 +304,12 @@ def _init_arrays(
             min_shape[axis] = L_min
             max_shape = list(volume_shape)
             max_shape[axis] = L_max
-            components.append((
-                jnp.zeros(min_shape, dtype=config.dtype),
-                jnp.zeros(max_shape, dtype=config.dtype),
-            ))
+            components.append(
+                (
+                    jnp.zeros(min_shape, dtype=config.dtype),
+                    jnp.zeros(max_shape, dtype=config.dtype),
+                )
+            )
         return tuple(components)
 
     psi_E = _make_sparse_psi()
@@ -359,7 +363,7 @@ def _init_arrays(
         inv_permittivities = create_named_sharded_matrix(
             (num_perm_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=config.material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -371,7 +375,7 @@ def _init_arrays(
         inv_permeabilities = create_named_sharded_matrix(
             (num_permeability_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=config.material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -384,7 +388,7 @@ def _init_arrays(
         electric_conductivity = create_named_sharded_matrix(
             (num_electric_cond_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=config.material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -397,7 +401,7 @@ def _init_arrays(
         magnetic_conductivity = create_named_sharded_matrix(
             (num_magnetic_cond_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=config.material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -417,17 +421,17 @@ def _init_arrays(
                 if num_perm_components == 1:
                     # Isotropic: simple element-wise inversion
                     perm_tuple = (o.material.permittivity[0],)
-                    inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.material_dtype))[:, None, None, None]
                     inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
                 elif num_perm_components == 3:
                     # Diagonally anisotropic: simple element-wise inversion
                     perm_tuple = (o.material.permittivity[0], o.material.permittivity[4], o.material.permittivity[8])
-                    inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.material_dtype))[:, None, None, None]
                     inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
                 else:
                     # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
                     perm_tuple = o.material.permittivity
-                    perm_matrix = jnp.array(perm_tuple, dtype=config.dtype).reshape(3, 3)
+                    perm_matrix = jnp.array(perm_tuple, dtype=config.material_dtype).reshape(3, 3)
                     inv_perm_matrix = jnp.linalg.inv(perm_matrix)
                     inv_obj_permittivity = inv_perm_matrix.flatten()[:, None, None, None]
                     inv_permittivities = inv_permittivities.at[:, *o.grid_slice].set(inv_obj_permittivity)
@@ -436,17 +440,17 @@ def _init_arrays(
                 if num_permeability_components == 1:
                     # Isotropic: simple element-wise inversion
                     perm_tuple = (o.material.permeability[0],)
-                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=config.material_dtype))[:, None, None, None]
                     inv_permeabilities = inv_permeabilities.at[:, *o.grid_slice].set(inv_obj_permeability)
                 elif num_permeability_components == 3:
                     # Diagonally anisotropic: simple element-wise inversion
                     perm_tuple = (o.material.permeability[0], o.material.permeability[4], o.material.permeability[8])
-                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=config.material_dtype))[:, None, None, None]
                     inv_permeabilities = inv_permeabilities.at[:, *o.grid_slice].set(inv_obj_permeability)
                 else:
                     # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
                     perm_tuple = o.material.permeability
-                    perm_matrix = jnp.array(perm_tuple, dtype=config.dtype).reshape(3, 3)
+                    perm_matrix = jnp.array(perm_tuple, dtype=config.material_dtype).reshape(3, 3)
                     inv_perm_matrix = jnp.linalg.inv(perm_matrix)
                     inv_obj_permeability = inv_perm_matrix.flatten()[:, None, None, None]
                     inv_permeabilities = inv_permeabilities.at[:, *o.grid_slice].set(inv_obj_permeability)
@@ -467,7 +471,7 @@ def _init_arrays(
                     cond_tuple = o.material.electric_conductivity
 
                 # scale by grid size
-                obj_electric_conductivity = (jnp.array(cond_tuple, dtype=config.dtype) * config.resolution)[
+                obj_electric_conductivity = (jnp.array(cond_tuple, dtype=config.material_dtype) * config.resolution)[
                     :, None, None, None
                 ]
                 electric_conductivity = electric_conductivity.at[:, *o.grid_slice].set(obj_electric_conductivity)
@@ -488,7 +492,7 @@ def _init_arrays(
                     cond_tuple = o.material.magnetic_conductivity
 
                 # scale by grid size
-                obj_magnetic_conductivity = (jnp.array(cond_tuple, dtype=config.dtype) * config.resolution)[
+                obj_magnetic_conductivity = (jnp.array(cond_tuple, dtype=config.material_dtype) * config.resolution)[
                     :, None, None, None
                 ]
                 magnetic_conductivity = magnetic_conductivity.at[:, *o.grid_slice].set(obj_magnetic_conductivity)
@@ -504,13 +508,16 @@ def _init_arrays(
                         o.materials,
                         isotropic=isotropic_permittivity,
                         diagonally_anisotropic=diagonally_anisotropic_permittivity,
-                    )
+                    ),
+                    dtype=config.material_dtype,
                 )
                 if num_perm_components == 1 or num_perm_components == 3:
                     allowed_inv_perms = 1 / allowed_perms  # shape: (num_materials, num_components)
                 else:
                     # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
-                    allowed_inv_perms = jnp.array([jnp.linalg.inv(perm.reshape(3, 3)).flatten() for perm in allowed_perms])
+                    allowed_inv_perms = jnp.array(
+                        [jnp.linalg.inv(perm.reshape(3, 3)).flatten() for perm in allowed_perms]
+                    )
 
                 # allowed_inv_perms[indices] -> (*grid_shape, num_components)
                 # After moveaxis -> (num_components, *grid_shape)
@@ -524,7 +531,8 @@ def _init_arrays(
                         o.materials,
                         isotropic=isotropic_permeability,
                         diagonally_anisotropic=diagonally_anisotropic_permeability,
-                    )
+                    ),
+                    dtype=config.material_dtype,
                 )
                 if num_permeability_components == 1 or num_permeability_components == 3:
                     allowed_inv_perms = 1 / allowed_perms
@@ -544,7 +552,8 @@ def _init_arrays(
                         o.materials,
                         isotropic=isotropic_electric_conductivity,
                         diagonally_anisotropic=diagonally_anisotropic_electric_conductivity,
-                    )
+                    ),
+                    dtype=config.material_dtype,
                 )
 
                 component_values = jnp.moveaxis(allowed_conds[indices], -1, 0) * config.resolution
@@ -557,7 +566,8 @@ def _init_arrays(
                         o.materials,
                         isotropic=isotropic_magnetic_conductivity,
                         diagonally_anisotropic=diagonally_anisotropic_magnetic_conductivity,
-                    )
+                    ),
+                    dtype=config.material_dtype,
                 )
 
                 component_values = jnp.moveaxis(allowed_conds[indices], -1, 0) * config.resolution

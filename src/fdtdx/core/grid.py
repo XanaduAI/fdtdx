@@ -9,16 +9,16 @@ from fdtdx import constants
 def calculate_spatial_offsets_yee() -> tuple[jax.Array, jax.Array]:
     offset_E = jnp.stack(
         [
-            jnp.asarray([0.5, 0, 0])[None, None, None, :],
-            jnp.asarray([0, 0.5, 0])[None, None, None, :],
-            jnp.asarray([0, 0, 0.5])[None, None, None, :],
+            jnp.asarray([0.5, 0, 0], dtype=jnp.float32)[None, None, None, :],
+            jnp.asarray([0, 0.5, 0], dtype=jnp.float32)[None, None, None, :],
+            jnp.asarray([0, 0, 0.5], dtype=jnp.float32)[None, None, None, :],
         ]
     )
     offset_H = jnp.stack(
         [
-            jnp.asarray([0, 0.5, 0.5])[None, None, None, :],
-            jnp.asarray([0.5, 0, 0.5])[None, None, None, :],
-            jnp.asarray([0.5, 0.5, 0])[None, None, None, :],
+            jnp.asarray([0, 0.5, 0.5], dtype=jnp.float32)[None, None, None, :],
+            jnp.asarray([0.5, 0, 0.5], dtype=jnp.float32)[None, None, None, :],
+            jnp.asarray([0.5, 0.5, 0], dtype=jnp.float32)[None, None, None, :],
         ]
     )
     return offset_E, offset_H
@@ -49,9 +49,9 @@ def calculate_time_offset_yee(
 
     # phase variation
     x, y, z = jnp.meshgrid(
-        jnp.arange(spatial_shape[0]),
-        jnp.arange(spatial_shape[1]),
-        jnp.arange(spatial_shape[2]),
+        jnp.arange(spatial_shape[0], dtype=jnp.float32),
+        jnp.arange(spatial_shape[1], dtype=jnp.float32),
+        jnp.arange(spatial_shape[2], dtype=jnp.float32),
         indexing="ij",
     )
     xyz = jnp.stack([x, y, z], axis=-1)
@@ -64,16 +64,16 @@ def calculate_time_offset_yee(
     # yee grid offsets
     xyz_E = jnp.stack(
         [
-            xyz + jnp.asarray([0.5, 0, 0])[None, None, None, :],
-            xyz + jnp.asarray([0, 0.5, 0])[None, None, None, :],
-            xyz + jnp.asarray([0, 0, 0.5])[None, None, None, :],
+            xyz + jnp.asarray([0.5, 0, 0], dtype=jnp.float32)[None, None, None, :],
+            xyz + jnp.asarray([0, 0.5, 0], dtype=jnp.float32)[None, None, None, :],
+            xyz + jnp.asarray([0, 0, 0.5], dtype=jnp.float32)[None, None, None, :],
         ]
     )
     xyz_H = jnp.stack(
         [
-            xyz + jnp.asarray([0, 0.5, 0.5])[None, None, None, :],
-            xyz + jnp.asarray([0.5, 0, 0.5])[None, None, None, :],
-            xyz + jnp.asarray([0.5, 0.5, 0])[None, None, None, :],
+            xyz + jnp.asarray([0, 0.5, 0.5], dtype=jnp.float32)[None, None, None, :],
+            xyz + jnp.asarray([0.5, 0, 0.5], dtype=jnp.float32)[None, None, None, :],
+            xyz + jnp.asarray([0.5, 0.5, 0], dtype=jnp.float32)[None, None, None, :],
         ]
     )
 
@@ -81,7 +81,7 @@ def calculate_time_offset_yee(
     travel_offset_H = -jnp.dot(xyz_H, wave_vector)
 
     if effective_index is not None:
-        refractive_idx = effective_index * jnp.ones(spatial_shape)
+        refractive_idx = effective_index * jnp.ones(spatial_shape, dtype=jnp.float32)
     else:
         # adjust speed for material and calculate time offset
         if inv_permittivities.ndim == 4:

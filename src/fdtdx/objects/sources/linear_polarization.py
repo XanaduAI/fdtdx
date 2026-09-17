@@ -60,8 +60,8 @@ class LinearlyPolarizedPlaneSource(TFSFPlaneSource, ABC):
 
         # map amplitude to propagation plane
         w, h = jnp.meshgrid(
-            jnp.arange(self.grid_shape[self.horizontal_axis]),
-            jnp.arange(self.grid_shape[self.vertical_axis]),
+            jnp.arange(self.grid_shape[self.horizontal_axis], dtype=jnp.float32),
+            jnp.arange(self.grid_shape[self.vertical_axis], dtype=jnp.float32),
             indexing="ij",
         )
         wh_indices = jnp.stack((w, h), axis=-1)
@@ -182,8 +182,11 @@ class GaussianPlaneSource(LinearlyPolarizedPlaneSource):
         std: float,
     ) -> jax.Array:  # shape (*grid_shape)
         grid = (
-            jnp.stack(jnp.meshgrid(*map(jnp.arange, (height, width)), indexing="xy"), axis=-1) - jnp.asarray(center)
-        ) / jnp.asarray(radii)
+            jnp.stack(
+                jnp.meshgrid(*(jnp.arange(n, dtype=jnp.float32) for n in (height, width)), indexing="xy"), axis=-1
+            )
+            - jnp.asarray(center, dtype=jnp.float32)
+        ) / jnp.asarray(radii, dtype=jnp.float32)
         euc_dist = (grid**2).sum(axis=-1)
 
         mask = euc_dist < 1

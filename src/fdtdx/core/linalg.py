@@ -57,13 +57,16 @@ def get_single_directional_rotation_matrix(
     Returns:
         jax.Array: 3x3 rotation matrix
     """
+    # jnp.cos/sin of a plain python float return jax's default dtype (float64 under
+    # x64), and nothing here is already typed to inherit float32 from.
     if rotation_axis == 0:
         return jnp.asarray(
             [
                 [1, 0, 0],
                 [0, jnp.cos(angle_radians), -jnp.sin(angle_radians)],
                 [0, jnp.sin(angle_radians), jnp.cos(angle_radians)],
-            ]
+            ],
+            dtype=jnp.float32,
         )
     elif rotation_axis == 1:
         return jnp.asarray(
@@ -71,7 +74,8 @@ def get_single_directional_rotation_matrix(
                 [jnp.cos(angle_radians), 0, -jnp.sin(angle_radians)],
                 [0, 1, 0],
                 [jnp.sin(angle_radians), 0, jnp.cos(angle_radians)],
-            ]
+            ],
+            dtype=jnp.float32,
         )
     elif rotation_axis == 2:
         return jnp.asarray(
@@ -79,7 +83,8 @@ def get_single_directional_rotation_matrix(
                 [jnp.cos(angle_radians), -jnp.sin(angle_radians), 0],
                 [jnp.sin(angle_radians), jnp.cos(angle_radians), 0],
                 [0, 0, 1],
-            ]
+            ],
+            dtype=jnp.float32,
         )
     raise Exception(f"Invalid rotation axis: {rotation_axis}")
 
