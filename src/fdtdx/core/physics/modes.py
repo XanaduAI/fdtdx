@@ -137,6 +137,10 @@ def compute_mode(
         ):
             raise Exception(f"Invalid shape of inv_permeabilities: {inv_permeabilities.shape}")
 
+    # The solver runs at precision="double"; keep that through the callback instead
+    # of truncating. Without x64 jax cannot hold complex128, so fall back there.
+    mode_dtype = np.complex128 if jax.config.jax_enable_x64 else np.complex64
+
     def mode_helper(permittivity, permeability):
         modes = tidy3d_mode_computation_wrapper(
             frequency=frequency,
@@ -154,23 +158,23 @@ def compute_mode(
 
         if propagation_axis == 0:
             mode_E, mode_H = (
-                np.stack([mode.Ez, mode.Ex, mode.Ey], axis=0).astype(np.complex64),
-                np.stack([mode.Hz, mode.Hx, mode.Hy], axis=0).astype(np.complex64),
+                np.stack([mode.Ez, mode.Ex, mode.Ey], axis=0).astype(mode_dtype),
+                np.stack([mode.Hz, mode.Hx, mode.Hy], axis=0).astype(mode_dtype),
             )
         elif propagation_axis == 1:
             mode_E, mode_H = (
-                np.stack([mode.Ex, mode.Ez, mode.Ey], axis=0).astype(np.complex64),
-                -np.stack([mode.Hx, mode.Hz, mode.Hy], axis=0).astype(np.complex64),
+                np.stack([mode.Ex, mode.Ez, mode.Ey], axis=0).astype(mode_dtype),
+                -np.stack([mode.Hx, mode.Hz, mode.Hy], axis=0).astype(mode_dtype),
             )
         elif propagation_axis == 2:
             mode_E, mode_H = (
-                np.stack([mode.Ex, mode.Ey, mode.Ez], axis=0).astype(np.complex64),
-                np.stack([mode.Hx, mode.Hy, mode.Hz], axis=0).astype(np.complex64),
+                np.stack([mode.Ex, mode.Ey, mode.Ez], axis=0).astype(mode_dtype),
+                np.stack([mode.Hx, mode.Hy, mode.Hz], axis=0).astype(mode_dtype),
             )
         else:
             raise Exception("This should never happen")
 
-        neff = np.asarray(mode.neff).astype(np.complex64)
+        neff = np.asarray(mode.neff).astype(mode_dtype)
         return mode_E, mode_H, neff
 
     # compute input to tidy3d Mode solver
@@ -218,9 +222,9 @@ def compute_mode(
         permittivity_squeezed = permittivity_squeezed[jnp.array(perm_idx_full_anisotropy), :, :]
 
     result_shape_dtype = (
-        jnp.zeros((3, *permittivity_squeezed.shape[1:]), dtype=jnp.complex64),
-        jnp.zeros((3, *permittivity_squeezed.shape[1:]), dtype=jnp.complex64),
-        jnp.zeros(shape=(), dtype=jnp.complex64),
+        jnp.zeros((3, *permittivity_squeezed.shape[1:]), dtype=mode_dtype),
+        jnp.zeros((3, *permittivity_squeezed.shape[1:]), dtype=mode_dtype),
+        jnp.zeros(shape=(), dtype=mode_dtype),
     )
 
     if isinstance(inv_permeabilities, jax.Array) and inv_permeabilities.ndim > 0 and inv_permeabilities.shape[0] == 9:
@@ -258,7 +262,9 @@ def compute_mode(
     mode_H = jnp.expand_dims(mode_H_raw, axis=propagation_axis + 1)
 
     # Tidy3D uses different scaling internally, so convert back
-    mode_H = mode_H * tidy3d.constants.ETA_0
+    # float() because tidy3d's constants are strongly-typed numpy.float64 scalars,
+    # which would promote a complex64 field to complex128 under x64.
+    mode_H = mode_H * float(tidy3d.constants.ETA_0)
 
     mode_E_norm, mode_H_norm = normalize_by_poynting_flux(mode_E, mode_H, axis=propagation_axis)
 

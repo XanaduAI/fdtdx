@@ -29,8 +29,10 @@ class PhasorDetector(Detector):
     components: Sequence[Literal["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"]] = frozen_field(
         default=("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"),
     )
+    #: Accumulator dtype for the phasor sum, taken over every recorded step. A weak
+    #: component's per-step term can fall below one complex64 ULP. Needs jax x64.
     dtype: jnp.dtype = frozen_field(
-        default=jnp.complex64,
+        default=jnp.complex128,
     )
 
     #: Whether to plot the measured data. Defaults to False.
