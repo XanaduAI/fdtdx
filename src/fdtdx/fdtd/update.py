@@ -80,23 +80,16 @@ def update_E(
     sigma_E_is_full_tensor = sigma_E is not None and sigma_E.shape[0] == 9
 
     if not inv_eps_is_full_tensor and not sigma_E_is_full_tensor:
-        # Isotropic and diagonal anisotropic case
-        factor = 1
+        # Isotropic/diagonal case, written as a delta so `half` never meets a bare 1
+        # and rounds away when E_old outranks sigma_E/inv_eps. Schneider ch. 3.12.
         if sigma_E is not None:
-            # update formula for lossy material. Simplifies to Noop for conductivity = 0
-            # for details see Schneider, chapter 3.12
             # Component-wise multiplication: sigma_E[i, x, y, z] * inv_eps[i, x, y, z]
-            factor = 1 - c * sigma_E * eta0 * inv_eps / 2
-
-        # standard update formula using lossless material
-        # Component-wise multiplication for diagonally anisotropic materials:
-        # E[i, x, y, z] = factor * E[i, x, y, z] + c * curl[i, x, y, z] * inv_eps[i, x, y, z]
-        E = factor * arrays.E + c * curl * inv_eps
-
-        if sigma_E is not None:
-            # update formula for lossy material. Simplifies to Noop for conductivity = 0
-            # for details see Schneider, chapter 3.12
-            E = E / (1 + c * sigma_E * eta0 * inv_eps / 2)
+            half = c * sigma_E * eta0 * inv_eps / 2
+            delta = (c * curl * inv_eps - 2 * half * arrays.E) / (1 + half)
+            E = arrays.E + delta
+        else:
+            # standard update formula using lossless material
+            E = arrays.E + c * curl * inv_eps
 
     else:
         # Full anisotropic case: expand inv_eps and sigma_E to (3, 3, Nx, Ny, Nz)
@@ -105,46 +98,36 @@ def update_E(
 
         # Compute A and B matrices for forward update
         # E^(n+1) = A @ E^(n) + B @ curl(H^(n+1/2))
-        A, B = compute_anisotropic_update_matrices(inv_eps, sigma_E, c, eta0) # (3, 3, Nx, Ny, Nz)
+        A, B = compute_anisotropic_update_matrices(inv_eps, sigma_E, c, eta0)  # (3, 3, Nx, Ny, Nz)
 
         # We need to pad the fields and curl to account for ghost cells when computing the averages
-        E_pad = pad_fields(arrays.E, periodic_axes) # (3, Nx+2, Ny+2, Nz+2)
+        E_pad = pad_fields(arrays.E, periodic_axes)  # (3, Nx+2, Ny+2, Nz+2)
         curl_pad = pad_fields(curl, periodic_axes)  # (3, Nx+2, Ny+2, Nz+2)
-        #"""
-        A = A.reshape((9, *A.shape[2:])) # (9, Nx, Ny, Nz)
-        B = B.reshape((9, *B.shape[2:])) # (9, Nx, Ny, Nz)
-        A_pad = pad_fields(A, (True, True, True))   # (9, Nx+2, Ny+2, Nz+2)
-        B_pad = pad_fields(B, (True, True, True))   # (9, Nx+2, Ny+2, Nz+2)
+        # """
+        A = A.reshape((9, *A.shape[2:]))  # (9, Nx, Ny, Nz)
+        B = B.reshape((9, *B.shape[2:]))  # (9, Nx, Ny, Nz)
+        A_pad = pad_fields(A, (True, True, True))  # (9, Nx+2, Ny+2, Nz+2)
+        B_pad = pad_fields(B, (True, True, True))  # (9, Nx+2, Ny+2, Nz+2)
 
         def averaged_E_fields(e0, c0, c1):
-            P0 =    (
-                        A[e0] * \
-                        (
-                            arrays.E[c1] + \
-                            jnp.roll(E_pad[c1], 1, axis=c1)[1:-1, 1:-1, 1:-1]  
-                        ) / 2
-                    ) + \
-                    (
-                        B[e0] * \
-                        (
-                            curl[c1] + \
-                            jnp.roll(curl_pad[c1], 1, axis=c1)[1:-1, 1:-1, 1:-1]
-                        ) / 2
-                    )
-            P1 =    (
-                        jnp.roll(A_pad[e0], -1, axis=c0)[1:-1, 1:-1, 1:-1] * \
-                        (
-                            jnp.roll(E_pad[c1], -1, axis=c0)[1:-1, 1:-1, 1:-1] + \
-                            jnp.roll(E_pad[c1], (-1, 1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
-                        ) / 2
-                    ) + \
-                    (
-                        jnp.roll(B_pad[e0], -1, axis=c0)[1:-1, 1:-1, 1:-1] * \
-                        (
-                            jnp.roll(curl_pad[c1], -1, axis=c0)[1:-1, 1:-1, 1:-1] + \
-                            jnp.roll(curl_pad[c1], (-1, 1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
-                        ) / 2
-                    )
+            P0 = (A[e0] * (arrays.E[c1] + jnp.roll(E_pad[c1], 1, axis=c1)[1:-1, 1:-1, 1:-1]) / 2) + (
+                B[e0] * (curl[c1] + jnp.roll(curl_pad[c1], 1, axis=c1)[1:-1, 1:-1, 1:-1]) / 2
+            )
+            P1 = (
+                jnp.roll(A_pad[e0], -1, axis=c0)[1:-1, 1:-1, 1:-1]
+                * (
+                    jnp.roll(E_pad[c1], -1, axis=c0)[1:-1, 1:-1, 1:-1]
+                    + jnp.roll(E_pad[c1], (-1, 1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
+                )
+                / 2
+            ) + (
+                jnp.roll(B_pad[e0], -1, axis=c0)[1:-1, 1:-1, 1:-1]
+                * (
+                    jnp.roll(curl_pad[c1], -1, axis=c0)[1:-1, 1:-1, 1:-1]
+                    + jnp.roll(curl_pad[c1], (-1, 1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
+                )
+                / 2
+            )
             return (P0 + P1) / 2
 
         Exx = A[0] * arrays.E[0] + B[0] * curl[0]
@@ -155,7 +138,7 @@ def update_E(
         Eyz = averaged_E_fields(5, 1, 2)
         Ezx = averaged_E_fields(6, 2, 0)
         Ezy = averaged_E_fields(7, 2, 1)
-        Ezz = A[8] * arrays.E[2] + B[8] * curl[2]      
+        Ezz = A[8] * arrays.E[2] + B[8] * curl[2]
 
         Ex = Exx + Exy + Exz
         Ey = Eyx + Eyy + Eyz
@@ -245,12 +228,14 @@ def update_E_reverse(
     sigma_E_is_full_tensor = sigma_E is not None and sigma_E.shape[0] == 9
 
     if not inv_eps_is_full_tensor and not sigma_E_is_full_tensor:
-        # Isotropic and diagonal anisotropic case
-        factor = 1
+        # Exact inverse of update_E: E0 = E1 + (2*half*E1 - K) / (1 - half). Unlike the
+        # old form K is divided by (1 - half), matching the anisotropic path.
         if sigma_E is not None:
-            E = E * (1 + c * sigma_E * eta0 * inv_eps / 2)
-            factor = 1 - c * sigma_E * eta0 * inv_eps / 2
-        E = E / factor - c * curl * inv_eps
+            half = c * sigma_E * eta0 * inv_eps / 2
+            delta = (2 * half * E - c * curl * inv_eps) / (1 - half)
+            E = E + delta
+        else:
+            E = E - c * curl * inv_eps
 
     else:
         # Full anisotropic case: expand inv_eps and sigma_E to (3, 3, Nx, Ny, Nz)
@@ -354,20 +339,15 @@ def update_H(
     sigma_H_is_full_tensor = sigma_H is not None and sigma_H.shape[0] == 9
 
     if not inv_mu_is_full_tensor and not sigma_H_is_full_tensor:
-        # Isotropic and diagonal anisotropic case
-        factor = 1
+        # Same delta form as update_E (see there), with the curl term's sign flipped:
+        # delta = (-K - 2*half*H_old) / (1 + half), K = c * curl * inv_mu.
         if sigma_H is not None:
-            # update formula for lossy material. Simplifies to Noop for conductivity = 0
-            # for details see Schneider, chapter 3.12
-            factor = 1 - c * sigma_H / eta0 * inv_mu / 2
-
-        # standard update formula for lossless material
-        H = factor * arrays.H - c * curl * inv_mu
-
-        if sigma_H is not None:
-            # update formula for lossy material. Simplifies to NoOp for conductivity = 0
-            # for details see Schneider, chapter 3.12
-            H = H / (1 + c * sigma_H / eta0 * inv_mu / 2)
+            half = c * sigma_H / eta0 * inv_mu / 2
+            delta = (-c * curl * inv_mu - 2 * half * arrays.H) / (1 + half)
+            H = arrays.H + delta
+        else:
+            # standard update formula for lossless material
+            H = arrays.H - c * curl * inv_mu
 
     else:
         # Full anisotropic case: expand inv_mu and sigma_H to (3, 3, Nx, Ny, Nz)
@@ -376,45 +356,35 @@ def update_H(
 
         # Compute A and B matrices for forward update
         # H^(n+1/2) = A @ H^(n-1/2) - B @ curl(E^(n))
-        A, B = compute_anisotropic_update_matrices(inv_mu, sigma_H, c, 1 / eta0) # (3, 3, Nx, Ny, Nz)
-        
+        A, B = compute_anisotropic_update_matrices(inv_mu, sigma_H, c, 1 / eta0)  # (3, 3, Nx, Ny, Nz)
+
         # We need to pad the fields and curl to account for ghost cells when computing the averages
-        H_pad = pad_fields(arrays.H, periodic_axes) # (3, Nx+2, Ny+2, Nz+2)
+        H_pad = pad_fields(arrays.H, periodic_axes)  # (3, Nx+2, Ny+2, Nz+2)
         curl_pad = pad_fields(curl, periodic_axes)  # (3, Nx+2, Ny+2, Nz+2)
-        #"""
-        A = A.reshape((9, *A.shape[2:])) # (9, Nx, Ny, Nz)
-        B = B.reshape((9, *B.shape[2:])) # (9, Nx, Ny, Nz)
-        A_pad = pad_fields(A, (True, True, True))   # (9, Nx+2, Ny+2, Nz+2)
-        B_pad = pad_fields(B, (True, True, True))   # (9, Nx+2, Ny+2, Nz+2)
+        # """
+        A = A.reshape((9, *A.shape[2:]))  # (9, Nx, Ny, Nz)
+        B = B.reshape((9, *B.shape[2:]))  # (9, Nx, Ny, Nz)
+        A_pad = pad_fields(A, (True, True, True))  # (9, Nx+2, Ny+2, Nz+2)
+        B_pad = pad_fields(B, (True, True, True))  # (9, Nx+2, Ny+2, Nz+2)
 
         def averaged_H_fields(h0, c0, c1):
-            P0 = (
-                A[h0] * \
-                (
-                    arrays.H[c1] + \
-                    jnp.roll(H_pad[c1], -1, axis=c1)[1:-1, 1:-1, 1:-1]
-                ) / 2
-            ) - \
-            (
-                B[h0] * \
-                (
-                    curl[c1] + \
-                    jnp.roll(curl_pad[c1], -1, axis=c1)[1:-1, 1:-1, 1:-1]
-                ) / 2
+            P0 = (A[h0] * (arrays.H[c1] + jnp.roll(H_pad[c1], -1, axis=c1)[1:-1, 1:-1, 1:-1]) / 2) - (
+                B[h0] * (curl[c1] + jnp.roll(curl_pad[c1], -1, axis=c1)[1:-1, 1:-1, 1:-1]) / 2
             )
             P1 = (
-                jnp.roll(A_pad[h0], 1, axis=c0)[1:-1, 1:-1, 1:-1] * \
-                (
-                    jnp.roll(H_pad[c1], 1, axis=c0)[1:-1, 1:-1, 1:-1] + \
-                    jnp.roll(H_pad[c1], (1, -1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
-                ) / 2
-            ) - \
-            (
-                jnp.roll(B_pad[h0], 1, axis=c0)[1:-1, 1:-1, 1:-1] * \
-                (
-                    jnp.roll(curl_pad[c1], 1, axis=c0)[1:-1, 1:-1, 1:-1] + \
-                    jnp.roll(curl_pad[c1], (1, -1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
-                ) / 2
+                jnp.roll(A_pad[h0], 1, axis=c0)[1:-1, 1:-1, 1:-1]
+                * (
+                    jnp.roll(H_pad[c1], 1, axis=c0)[1:-1, 1:-1, 1:-1]
+                    + jnp.roll(H_pad[c1], (1, -1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
+                )
+                / 2
+            ) - (
+                jnp.roll(B_pad[h0], 1, axis=c0)[1:-1, 1:-1, 1:-1]
+                * (
+                    jnp.roll(curl_pad[c1], 1, axis=c0)[1:-1, 1:-1, 1:-1]
+                    + jnp.roll(curl_pad[c1], (1, -1), axis=(c0, c1))[1:-1, 1:-1, 1:-1]
+                )
+                / 2
             )
             return (P0 + P1) / 2
 
@@ -518,13 +488,14 @@ def update_H_reverse(
     sigma_H_is_full_tensor = sigma_H is not None and sigma_H.shape[0] == 9
 
     if not inv_mu_is_full_tensor and not sigma_H_is_full_tensor:
-        # Isotropic and diagonal anisotropic case
-        factor = 1
+        # Exact inverse of update_H (lossy materials gain when run backwards):
+        # H0 = H1 + (2*half*H1 + K) / (1 - half).
         if sigma_H is not None:
-            # lossy materials get gain when simulating backwards
-            H = H * (1 + c * sigma_H / eta0 * inv_mu / 2)
-            factor = 1 - c * sigma_H / eta0 * inv_mu / 2
-        H = H / factor + c * curl * inv_mu
+            half = c * sigma_H / eta0 * inv_mu / 2
+            delta = (2 * half * H + c * curl * inv_mu) / (1 - half)
+            H = H + delta
+        else:
+            H = H + c * curl * inv_mu
 
     else:
         # Full anisotropic case: expand inv_mu and sigma_H to (3, 3, Nx, Ny, Nz)

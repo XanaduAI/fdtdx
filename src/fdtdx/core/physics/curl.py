@@ -44,31 +44,31 @@ def interpolate_fields(
     """
 
     if axis == 0:
-        E_y = E_y[1:-1,1:-1,1:-1]
-        E_z = E_z[1:-1,1:-1,1:-1]
-        H_x = H_x[1:-1,1:-1,1:-1]
+        E_y = E_y[1:-1, 1:-1, 1:-1]
+        E_z = E_z[1:-1, 1:-1, 1:-1]
+        H_x = H_x[1:-1, 1:-1, 1:-1]
 
-        E_x = (E_x[1:-1,1:-1,1:-1] + E_x[:-2,1:-1,1:-1]) / 2.0
-        H_y = (H_y[1:-1,1:-1,1:-1] + H_y[:-2,1:-1,1:-1]) / 2.0
-        H_z = (H_z[1:-1,1:-1,1:-1] + H_z[:-2,1:-1,1:-1]) / 2.0
+        E_x = (E_x[1:-1, 1:-1, 1:-1] + E_x[:-2, 1:-1, 1:-1]) / 2.0
+        H_y = (H_y[1:-1, 1:-1, 1:-1] + H_y[:-2, 1:-1, 1:-1]) / 2.0
+        H_z = (H_z[1:-1, 1:-1, 1:-1] + H_z[:-2, 1:-1, 1:-1]) / 2.0
 
     elif axis == 1:
-        E_x = E_x[1:-1,1:-1,1:-1]
-        E_z = E_z[1:-1,1:-1,1:-1]
-        H_y = H_y[1:-1,1:-1,1:-1]
+        E_x = E_x[1:-1, 1:-1, 1:-1]
+        E_z = E_z[1:-1, 1:-1, 1:-1]
+        H_y = H_y[1:-1, 1:-1, 1:-1]
 
-        E_y = (E_y[1:-1,1:-1,1:-1] + E_y[1:-1,:-2,1:-1]) / 2.0
-        H_x = (H_x[1:-1,1:-1,1:-1] + H_x[1:-1,:-2,1:-1]) / 2.0
-        H_z = (H_z[1:-1,1:-1,1:-1] + H_z[1:-1,:-2,1:-1]) / 2.0
+        E_y = (E_y[1:-1, 1:-1, 1:-1] + E_y[1:-1, :-2, 1:-1]) / 2.0
+        H_x = (H_x[1:-1, 1:-1, 1:-1] + H_x[1:-1, :-2, 1:-1]) / 2.0
+        H_z = (H_z[1:-1, 1:-1, 1:-1] + H_z[1:-1, :-2, 1:-1]) / 2.0
 
-    else: # axis == 2
-        E_x = E_x[1:-1,1:-1,1:-1]
-        E_y = E_y[1:-1,1:-1,1:-1]
-        H_z = H_z[1:-1,1:-1,1:-1]
+    else:  # axis == 2
+        E_x = E_x[1:-1, 1:-1, 1:-1]
+        E_y = E_y[1:-1, 1:-1, 1:-1]
+        H_z = H_z[1:-1, 1:-1, 1:-1]
 
-        E_z = (E_z[1:-1,1:-1,1:-1] + E_z[1:-1,1:-1,:-2]) / 2.0
-        H_x = (H_x[1:-1,1:-1,1:-1] + H_x[1:-1,1:-1,:-2]) / 2.0
-        H_y = (H_y[1:-1,1:-1,1:-1] + H_y[1:-1,1:-1,:-2]) / 2.0
+        E_z = (E_z[1:-1, 1:-1, 1:-1] + E_z[1:-1, 1:-1, :-2]) / 2.0
+        H_x = (H_x[1:-1, 1:-1, 1:-1] + H_x[1:-1, 1:-1, :-2]) / 2.0
+        H_y = (H_y[1:-1, 1:-1, 1:-1] + H_y[1:-1, 1:-1, :-2]) / 2.0
 
     E_interp = jnp.stack([E_x, E_y, E_z], axis=0)
     H_interp = jnp.stack([H_x, H_y, H_z], axis=0)
@@ -112,44 +112,61 @@ def _compute_pml_ab(
     sigma: PMLCoeffs1D,
     config: SimulationConfig,
 ) -> tuple[list[jax.Array], list[jax.Array]]:
-    """Compute PML update coefficients a and b from 1D profiles (all 6 components)."""
+    """Compute PML update coefficients a and (b - 1) from 1D profiles (all 6 components).
+
+    Returns (b - 1) rather than b itself. b = expm1(x) + 1 is the per-step psi decay
+    factor, and for a thin/weakly-absorbing PML region x can be far smaller than one
+    ULP of 1 -- adding 1 back in would round the decay away to exactly 1.0 (no
+    absorption at all, silently, for the run's lifetime), the same failure mode as
+    computing `1 - half` in the E/H conductivity update (see update.py). expm1 already
+    computes x = b - 1 accurately; keeping that result unreduced lets the psi update
+    apply it as psi + bm1*psi instead of b*psi, preserving the correction as long as
+    psi itself has enough precision to represent psi + bm1*psi distinctly from psi.
+    """
     factor = -config.courant_number * config.resolution / c0 / eps0
-    b_list = []
+    bm1_list = []
     a_list = []
     for i in range(6):
-        b_i = jnp.expm1(factor * (sigma[i] / kappa[i] + alpha[i])) + 1
+        bm1_i = jnp.expm1(factor * (sigma[i] / kappa[i] + alpha[i]))
         a_i = jnp.nan_to_num(
-            (b_i - 1.0) * sigma[i] / (sigma[i] + alpha[i] * kappa[i]) / kappa[i],
-            nan=0.0, posinf=0.0, neginf=0.0,
+            bm1_i * sigma[i] / (sigma[i] + alpha[i] * kappa[i]) / kappa[i],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
-        b_list.append(b_i)
+        bm1_list.append(bm1_i)
         a_list.append(a_i)
-    return b_list, a_list
+    return bm1_list, a_list
 
 
 def _update_sparse_psi(
     psi_min: jax.Array,
     psi_max: jax.Array,
-    b_profile: jax.Array,
+    bm1_profile: jax.Array,
     a_profile: jax.Array,
     d_field: jax.Array,
     axis: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Update one sparse psi component's min/max slabs."""
+    """Update one sparse psi component's min/max slabs.
+
+    Applies (b - 1) as psi + bm1*psi rather than b*psi (see _compute_pml_ab) so a tiny
+    per-step decay isn't rounded away when psi carries more precision than the material
+    (alpha/kappa/sigma) arrays bm1/a are computed from.
+    """
     L_min = psi_min.shape[axis]
     L_max = psi_max.shape[axis]
 
     if L_min > 0:
         d_min = _extract_pml_slab(d_field, axis, L_min, "min")
-        b_min = _extract_pml_slab(b_profile, axis, L_min, "min")
+        bm1_min = _extract_pml_slab(bm1_profile, axis, L_min, "min")
         a_min = _extract_pml_slab(a_profile, axis, L_min, "min")
-        psi_min = b_min * psi_min + a_min * d_min
+        psi_min = psi_min + bm1_min * psi_min + a_min * d_min
 
     if L_max > 0:
         d_max = _extract_pml_slab(d_field, axis, L_max, "max")
-        b_max = _extract_pml_slab(b_profile, axis, L_max, "max")
+        bm1_max = _extract_pml_slab(bm1_profile, axis, L_max, "max")
         a_max = _extract_pml_slab(a_profile, axis, L_max, "max")
-        psi_max = b_max * psi_max + a_max * d_max
+        psi_max = psi_max + bm1_max * psi_max + a_max * d_max
 
     return psi_min, psi_max
 
@@ -198,7 +215,11 @@ def curl_E(
             axis = PSI_COMPONENT_AXIS[i]
             ci = PSI_H_COEFF_IDX[i]
             psi_H_list[i] = _update_sparse_psi(
-                *psi_H[i], b[ci], a[ci], d_fields[i], axis,
+                *psi_H[i],
+                b[ci],
+                a[ci],
+                d_fields[i],
+                axis,
             )
 
     psi_H_updated = tuple(psi_H_list)
@@ -266,7 +287,11 @@ def curl_H(
             axis = PSI_COMPONENT_AXIS[i]
             ci = PSI_E_COEFF_IDX[i]
             psi_E_list[i] = _update_sparse_psi(
-                *psi_E[i], b[ci], a[ci], d_fields[i], axis,
+                *psi_E[i],
+                b[ci],
+                a[ci],
+                d_fields[i],
+                axis,
             )
 
     psi_E_updated = tuple(psi_E_list)
