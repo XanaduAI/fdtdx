@@ -1,3 +1,5 @@
+import os
+import warnings
 from collections import namedtuple
 from types import SimpleNamespace
 from typing import List, Literal
@@ -5,11 +7,35 @@ from typing import List, Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
-import tidy3d
-from tidy3d.components.mode.solver import compute_modes as _compute_modes
 
 from fdtdx.core.misc import expand_to_3x3
 from fdtdx.core.physics.metrics import normalize_by_poynting_flux
+
+MODE_SOLVER_ENV = "FDTDX_MODE_SOLVER"
+"""Environment variable selecting the mode solver, read once at import: "eleanormodes" (default) or "tidy3d"."""
+
+_requested_solver = os.environ.get(MODE_SOLVER_ENV, "").strip().lower()
+if _requested_solver not in ("", "eleanormodes", "tidy3d"):
+    raise ValueError(f"{MODE_SOLVER_ENV} must be 'eleanormodes' or 'tidy3d', got {_requested_solver!r}")
+
+MODE_SOLVER: Literal["eleanormodes", "tidy3d"] = "tidy3d"
+if _requested_solver != "tidy3d":
+    try:
+        from eleanormodes import compute_modes as _compute_modes
+        from silverhammerAPI.constants import ETA_0
+
+        MODE_SOLVER = "eleanormodes"
+    except ImportError:
+        if _requested_solver == "eleanormodes":
+            raise
+        warnings.warn(
+            f"eleanormodes is not installed; falling back to the Tidy3D mode solver "
+            f"(set {MODE_SOLVER_ENV}=tidy3d to silence this warning)",
+            stacklevel=2,
+        )
+if MODE_SOLVER == "tidy3d":
+    from tidy3d.components.mode.solver import compute_modes as _compute_modes
+    from tidy3d.constants import ETA_0
 
 ModeTupleType = namedtuple("Mode", ["neff", "Ex", "Ey", "Ez", "Hx", "Hy", "Hz"])
 """A named tuple containing the mode fields and effective index.
@@ -103,8 +129,10 @@ def compute_mode(
 ]:
     """Compute optical modes of a waveguide cross-section.
 
-    This function uses the Tidy3D mode solver to compute the optical modes of a given waveguide cross-section defined
-    by its permittivity distribution.
+    This function uses the mode solver selected by FDTDX_MODE_SOLVER (eleanormodes by default, or Tidy3D) to compute
+    the optical modes of a given waveguide cross-section defined by its permittivity distribution. Each permittivity
+    component is passed exactly as the FDTD grid stores it, i.e. sampled at its own E-field Yee position, and the
+    returned fields sit on the same Yee positions as the FDTD update for every propagation axis.
 
     By default modes are sorted by their effective index. The mode_index argument indexes this sorted list of modes and
     returns the desired mode. With filter_pol, it is also possible to only index a specific polarization.
@@ -261,10 +289,10 @@ def compute_mode(
     mode_E = jnp.expand_dims(mode_E_raw, axis=propagation_axis + 1)
     mode_H = jnp.expand_dims(mode_H_raw, axis=propagation_axis + 1)
 
-    # Tidy3D uses different scaling internally, so convert back
-    # float() because tidy3d's constants are strongly-typed numpy.float64 scalars,
+    # The solver returns H in SI units; fdtdx works with eta0 * H.
+    # float() because the solvers' constants are numpy.float64 scalars,
     # which would promote a complex64 field to complex128 under x64.
-    mode_H = mode_H * float(tidy3d.constants.ETA_0)
+    mode_H = mode_H * float(ETA_0)
 
     mode_E_norm, mode_H_norm = normalize_by_poynting_flux(mode_E, mode_H, axis=propagation_axis)
 
@@ -285,8 +313,9 @@ def tidy3d_mode_computation_wrapper(
 ) -> List[ModeTupleType]:
     """Compute optical modes of a waveguide cross-section.
 
-    This function uses the Tidy3D mode solver to compute the optical modes of a given
-    waveguide cross-section defined by its permittivity distribution.
+    This function uses the selected mode solver (see MODE_SOLVER_ENV) to compute the optical
+    modes of a given waveguide cross-section defined by its permittivity distribution. Both
+    solvers share Tidy3D's compute_modes interface.
 
     Args:
         frequency (float): Operating frequency in Hz
