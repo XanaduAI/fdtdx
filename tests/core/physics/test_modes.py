@@ -8,6 +8,7 @@ from fdtdx.core.physics.modes import (
     ModeTupleType,
     compute_mode,
     compute_mode_polarization_fraction,
+    compute_modes,
     sort_modes,
     tidy3d_mode_computation_wrapper,
 )
@@ -595,3 +596,99 @@ class TestTidy3DModeComputationWrapper:
 
         assert len(modes) == 1
         assert modes[0].neff == 1.6 + 0.2j
+
+
+def _fake_modes(num_modes, shape=(5, 4), seed=0):
+    """Distinct modes with decreasing neff, as tidy3d returns them."""
+    rng = np.random.default_rng(seed)
+
+    def field():
+        return rng.normal(size=shape) + 1j * rng.normal(size=shape)
+
+    return [
+        ModeTupleType(neff=2.0 - 0.01 * i + 0j, Ex=field(), Ey=field(), Ez=field(), Hx=field(), Hy=field(), Hz=field())
+        for i in range(num_modes)
+    ]
+
+
+def _backward(mode):
+    """tidy3d's "-" mode for a normalized "+" mode on a diagonal cross-section."""
+    return ModeTupleType(
+        neff=mode.neff,
+        Ex=-1j * mode.Ex,
+        Ey=-1j * mode.Ey,
+        Ez=1j * mode.Ez,
+        Hx=1j * mode.Hx,
+        Hy=1j * mode.Hy,
+        Hz=-1j * mode.Hz,
+    )
+
+
+class TestComputeModes:
+    """Test that compute_modes gets every requested mode from one solve."""
+
+    @staticmethod
+    def _recording_wrapper(pool, calls):
+        # A smaller request returns a prefix of a larger one, as tidy3d does with no target index.
+        def wrapper(**kwargs):
+            calls.append((kwargs["direction"], kwargs["num_modes"]))
+            modes = pool[: kwargs["num_modes"]]
+            return [_backward(m) for m in modes] if kwargs["direction"] == "-" else modes
+
+        return wrapper
+
+    def test_one_solve_matches_per_index_solves(self):
+        pool, calls = _fake_modes(40), []
+        inv_eps = jnp.ones((3, 1, 5, 4)) * 0.25
+        with patch(
+            "fdtdx.core.physics.modes.tidy3d_mode_computation_wrapper", side_effect=self._recording_wrapper(pool, calls)
+        ):
+            E, H, neff = compute_modes(2e14, inv_eps, 1.0, 1e-8, mode_indices=(0, 2, 4), directions=("+", "-"))
+            assert calls == [("+", 20)]  # padded for the largest index, solved once, "-" derived
+            for i, direction in enumerate(("+", "-")):
+                for j, k in enumerate((0, 2, 4)):
+                    E_k, H_k, n_k = compute_mode(2e14, inv_eps, 1.0, 1e-8, direction, mode_index=k)
+                    np.testing.assert_allclose(E[i, j], E_k, rtol=1e-6)
+                    np.testing.assert_allclose(H[i, j], H_k, rtol=1e-6)
+                    assert neff[i, j] == n_k
+
+    def test_compute_mode_still_solves_its_own_direction(self):
+        pool, calls = _fake_modes(20), []
+        with patch(
+            "fdtdx.core.physics.modes.tidy3d_mode_computation_wrapper", side_effect=self._recording_wrapper(pool, calls)
+        ):
+            compute_mode(2e14, jnp.ones((3, 1, 5, 4)), 1.0, 1e-8, "-", mode_index=1)
+        assert calls == [("-", 14)]
+
+    def test_tensorial_cross_section_solves_each_direction(self):
+        pool, calls = _fake_modes(20), []
+        inv_eps = jnp.zeros((9, 1, 5, 4)).at[jnp.array([0, 4, 8])].set(0.25).at[1].set(0.01).at[3].set(0.01)
+        with patch(
+            "fdtdx.core.physics.modes.tidy3d_mode_computation_wrapper", side_effect=self._recording_wrapper(pool, calls)
+        ):
+            compute_modes(2e14, inv_eps, 1.0, 1e-8, mode_indices=(0,), directions=("+", "-"))
+        assert calls == [("+", 12), ("-", 12)]
+
+    def test_too_few_modes_of_the_requested_polarization_raises(self):
+        # Ex is the TE component for tangential axes (0, 1): the first mode is pure TE, the rest pure TM.
+        modes = [m._replace(Ey=m.Ey * 0) if i == 0 else m._replace(Ex=m.Ex * 0) for i, m in enumerate(_fake_modes(14))]
+        with patch("fdtdx.core.physics.modes.tidy3d_mode_computation_wrapper", return_value=modes):
+            compute_modes(2e14, jnp.ones((3, 1, 5, 4)), 1.0, 1e-8, mode_indices=(0,), filter_pol="te")
+            # Raised inside jax.pure_callback, so jax re-raises it wrapped, with the message intact.
+            with pytest.raises(Exception, match="only 1 of the 14 solved modes are TE"):
+                compute_modes(2e14, jnp.ones((3, 1, 5, 4)), 1.0, 1e-8, mode_indices=(0, 1), filter_pol="te")
+
+    def test_backward_modes_match_a_real_backward_solve(self):
+        # Silicon strip in oxide; real tidy3d solves, propagation along axis 0.
+        eps = np.full((24, 16), 2.1)
+        eps[8:16, 5:11] = 12.0
+        inv_eps = jnp.asarray(np.broadcast_to(1.0 / eps, (3, 1, 24, 16)))
+        E, H, neff = compute_modes(1.93e14, inv_eps, 1.0, 5e-8, mode_indices=(0, 1, 2), directions=("+", "-"))
+        for j, k in enumerate((0, 1, 2)):
+            E_k, H_k, n_k = compute_mode(1.93e14, inv_eps, 1.0, 5e-8, "-", mode_index=k)
+            derived = np.concatenate([np.ravel(E[1, j]), np.ravel(H[1, j])])
+            solved = np.concatenate([np.ravel(E_k), np.ravel(H_k)])
+            # Eigenvectors are defined up to an overall sign; anything else is a real difference.
+            sign = np.sign(np.real(np.vdot(derived, solved)))
+            np.testing.assert_allclose(solved, sign * derived, atol=1e-5 * np.abs(solved).max())
+            np.testing.assert_allclose(neff[1, j], n_k, rtol=1e-6)

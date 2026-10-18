@@ -20,7 +20,7 @@ from fdtdx.core.physics.metrics import (
     normalize_by_energy,
     normalize_by_poynting_flux,
 )
-from fdtdx.core.physics.modes import compute_mode
+from fdtdx.core.physics.modes import compute_mode, compute_modes
 from fdtdx.core.switch import OnOffSwitch
 from fdtdx.core.wavelength import WaveCharacter
 from fdtdx.fdtd.backward import full_backward
@@ -114,6 +114,7 @@ __all__ = [
     "OnOffSwitch",
     "WaveCharacter",
     "compute_mode",
+    "compute_modes",
     # fdtd
     "run_fdtd",
     "place_objects",

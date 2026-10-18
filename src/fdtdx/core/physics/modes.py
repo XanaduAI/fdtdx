@@ -1,6 +1,6 @@
 from collections import namedtuple
 from types import SimpleNamespace
-from typing import List, Literal
+from typing import List, Literal, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -109,6 +109,9 @@ def compute_mode(
     By default modes are sorted by their effective index. The mode_index argument indexes this sorted list of modes and
     returns the desired mode. With filter_pol, it is also possible to only index a specific polarization.
 
+    This is :func:`compute_modes` for a single mode and direction, and makes the same solver call it always has. Use
+    :func:`compute_modes` to get several mode indices or both directions from one solve.
+
     Args:
         frequency (float): Operating frequency in Hz
         inv_permittivities (jax.Array): 3D array of inverse relative permittivity values
@@ -124,6 +127,61 @@ def compute_mode(
         Tuple[jax.Array, jax.Array, jax.Array]:
             Tuple of E, H field and the effective index as complex-valued jax arrays.
     """
+    mode_E, mode_H, eff_idx = compute_modes(
+        frequency=frequency,
+        inv_permittivities=inv_permittivities,
+        inv_permeabilities=inv_permeabilities,
+        resolution=resolution,
+        mode_indices=(mode_index,),
+        directions=(direction,),
+        filter_pol=filter_pol,
+    )
+    return mode_E[0, 0], mode_H[0, 0], eff_idx[0, 0]
+
+
+def compute_modes(
+    frequency: float,
+    inv_permittivities: jax.Array,  # shape (nx, ny, nz)
+    inv_permeabilities: jax.Array | float,
+    resolution: float,
+    mode_indices: Sequence[int],
+    directions: Sequence[Literal["+", "-"]] = ("+",),
+    filter_pol: Literal["te", "tm"] | None = None,
+) -> tuple[
+    jax.Array,  # E, shape (len(directions), len(mode_indices), 3, nx, ny, nz)
+    jax.Array,  # H, same shape as E
+    jax.Array,  # complex effective index, shape (len(directions), len(mode_indices))
+]:
+    """Compute several optical modes of a waveguide cross-section from a single mode solve.
+
+    Modes are ranked exactly as in :func:`compute_mode`: the solver is asked for ``2 * (k + 1) + 10`` modes, which are
+    sorted by effective index (matching ``filter_pol`` first, if given) before indexing, because the requested
+    ordering need not match the solver's. Here ``k`` is the largest requested index, so a single solve covers every
+    index: with no target index the solver returns the modes of highest effective index, so the modes a smaller
+    request would have returned are always among them.
+
+    With both directions requested on a cross-section whose permittivity and permeability are diagonal, only "+" is
+    solved and "-" is derived from it the way the solver derives it (see :func:`_backward_mode`). Otherwise each
+    direction is solved on its own.
+
+    Args:
+        frequency (float): Operating frequency in Hz
+        inv_permittivities (jax.Array): 3D array of inverse relative permittivity values
+        inv_permeabilities (jax.Array | float): 3D array of inverse relative permittivity values or single float for
+            uniform permeability distribution.
+        resolution (float): resolution of the simulation grid in meter.
+        mode_indices (Sequence[int]): Indices into the sorted mode list to return.
+        directions (Sequence[Literal["+", "-"]], optional): Propagation directions to return. Defaults to ("+",).
+        filter_pol (Literal["te", "tm"] | None, optional). If not None, modes are filtered by polarization.
+
+    Returns:
+        Tuple[jax.Array, jax.Array, jax.Array]: E and H fields, and the complex effective index, indexed by
+            direction and then by mode index in the order requested.
+
+    Raises:
+        ValueError: If ``filter_pol`` is given and the solve holds fewer modes of that polarization than a requested
+            index needs, where the sorted list would otherwise silently fall back to the other polarization.
+    """
     # Input validation
     if (
         not (inv_permittivities.ndim == 4 and inv_permittivities.shape[0] in [1, 3, 9])
@@ -136,46 +194,47 @@ def compute_mode(
             or sum(dim == 1 for dim in inv_permeabilities.shape[1:]) != 1
         ):
             raise Exception(f"Invalid shape of inv_permeabilities: {inv_permeabilities.shape}")
+    mode_indices = tuple(int(k) for k in mode_indices)
+    directions = tuple(directions)
+    if not mode_indices or min(mode_indices) < 0:
+        raise ValueError(f"mode_indices must be non-negative and non-empty, got {mode_indices}")
+    if not directions or len(set(directions)) != len(directions) or not set(directions) <= {"+", "-"}:
+        raise ValueError(f"directions must be distinct values of '+' and '-', got {directions}")
+    num_modes = 2 * (max(mode_indices) + 1) + 10
 
     # The solver runs at precision="double"; keep that through the callback instead
     # of truncating. Without x64 jax cannot hold complex128, so fall back there.
     mode_dtype = np.complex128 if jax.config.jax_enable_x64 else np.complex64
 
-    def mode_helper(permittivity, permeability):
-        modes = tidy3d_mode_computation_wrapper(
+    def solve(permittivity, permeability, direction):
+        return tidy3d_mode_computation_wrapper(
             frequency=frequency,
             permittivity_cross_section=permittivity,
             permeability_cross_section=permeability,
             coords=coords,
             direction=direction,
-            num_modes=2 * (mode_index + 1) + 10,
+            num_modes=num_modes,
         )
 
-        # sort modes by polarization
-        # tidy3d assumes propagation in the z-direction. The tangential axes are therefore x and y.
-        modes = sort_modes(modes, filter_pol, (0, 1))
-        mode = modes[mode_index]
-
-        if propagation_axis == 0:
-            mode_E, mode_H = (
-                np.stack([mode.Ez, mode.Ex, mode.Ey], axis=0).astype(mode_dtype),
-                np.stack([mode.Hz, mode.Hx, mode.Hy], axis=0).astype(mode_dtype),
-            )
-        elif propagation_axis == 1:
-            mode_E, mode_H = (
-                np.stack([mode.Ex, mode.Ez, mode.Ey], axis=0).astype(mode_dtype),
-                -np.stack([mode.Hx, mode.Hz, mode.Hy], axis=0).astype(mode_dtype),
-            )
-        elif propagation_axis == 2:
-            mode_E, mode_H = (
-                np.stack([mode.Ex, mode.Ey, mode.Ez], axis=0).astype(mode_dtype),
-                np.stack([mode.Hx, mode.Hy, mode.Hz], axis=0).astype(mode_dtype),
-            )
+    def mode_helper(permittivity, permeability):
+        if len(directions) > 1 and _is_diagonal_cross_section(permittivity, permeability):
+            forward = solve(permittivity, permeability, "+")
+            solved = {"+": forward, "-": [_backward_mode(mode) for mode in forward]}
         else:
-            raise Exception("This should never happen")
+            solved = {direction: solve(permittivity, permeability, direction) for direction in directions}
 
-        neff = np.asarray(mode.neff).astype(mode_dtype)
-        return mode_E, mode_H, neff
+        E_out, H_out, neff_out = [], [], []
+        for direction in directions:
+            # sort modes by polarization
+            # tidy3d assumes propagation in the z-direction. The tangential axes are therefore x and y.
+            modes = sort_modes(solved[direction], filter_pol, (0, 1))
+            if filter_pol is not None:
+                _check_polarization_count(modes, filter_pol, mode_indices)
+            fields = [_mode_fields(modes[k], propagation_axis, mode_dtype) for k in mode_indices]
+            E_out.append(np.stack([mode_E for mode_E, _, _ in fields]))
+            H_out.append(np.stack([mode_H for _, mode_H, _ in fields]))
+            neff_out.append(np.stack([neff for _, _, neff in fields]))
+        return np.stack(E_out), np.stack(H_out), np.stack(neff_out)
 
     # compute input to tidy3d Mode solver
     if inv_permittivities.shape[0] == 9:
@@ -221,10 +280,11 @@ def compute_mode(
     if permittivity_squeezed.shape[0] == 9:
         permittivity_squeezed = permittivity_squeezed[jnp.array(perm_idx_full_anisotropy), :, :]
 
+    batch_shape = (len(directions), len(mode_indices))
     result_shape_dtype = (
-        jnp.zeros((3, *permittivity_squeezed.shape[1:]), dtype=mode_dtype),
-        jnp.zeros((3, *permittivity_squeezed.shape[1:]), dtype=mode_dtype),
-        jnp.zeros(shape=(), dtype=mode_dtype),
+        jnp.zeros((*batch_shape, 3, *permittivity_squeezed.shape[1:]), dtype=mode_dtype),
+        jnp.zeros((*batch_shape, 3, *permittivity_squeezed.shape[1:]), dtype=mode_dtype),
+        jnp.zeros(shape=batch_shape, dtype=mode_dtype),
     )
 
     if isinstance(inv_permeabilities, jax.Array) and inv_permeabilities.ndim > 0 and inv_permeabilities.shape[0] == 9:
@@ -258,17 +318,109 @@ def compute_mode(
         jax.lax.stop_gradient(permittivity_squeezed),
         jax.lax.stop_gradient(permeability_squeezed),
     )
-    mode_E = jnp.expand_dims(mode_E_raw, axis=propagation_axis + 1)
-    mode_H = jnp.expand_dims(mode_H_raw, axis=propagation_axis + 1)
 
-    # Tidy3D uses different scaling internally, so convert back
-    # float() because tidy3d's constants are strongly-typed numpy.float64 scalars,
-    # which would promote a complex64 field to complex128 under x64.
-    mode_H = mode_H * float(tidy3d.constants.ETA_0)
+    E_rows, H_rows = [], []
+    for i in range(len(directions)):
+        E_row, H_row = [], []
+        for j in range(len(mode_indices)):
+            mode_E = jnp.expand_dims(mode_E_raw[i, j], axis=propagation_axis + 1)
+            mode_H = jnp.expand_dims(mode_H_raw[i, j], axis=propagation_axis + 1)
 
-    mode_E_norm, mode_H_norm = normalize_by_poynting_flux(mode_E, mode_H, axis=propagation_axis)
+            # Tidy3D uses different scaling internally, so convert back
+            # float() because tidy3d's constants are strongly-typed numpy.float64 scalars,
+            # which would promote a complex64 field to complex128 under x64.
+            mode_H = mode_H * float(tidy3d.constants.ETA_0)
 
-    return mode_E_norm, mode_H_norm, eff_idx
+            mode_E_norm, mode_H_norm = normalize_by_poynting_flux(mode_E, mode_H, axis=propagation_axis)
+            E_row.append(mode_E_norm)
+            H_row.append(mode_H_norm)
+        E_rows.append(jnp.stack(E_row))
+        H_rows.append(jnp.stack(H_row))
+
+    return jnp.stack(E_rows), jnp.stack(H_rows), eff_idx
+
+
+def _mode_fields(mode: ModeTupleType, propagation_axis: int, mode_dtype) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Stack a tidy3d mode's fields in fdtdx's axis order (tidy3d always propagates along its z)."""
+    if propagation_axis == 0:
+        mode_E, mode_H = (
+            np.stack([mode.Ez, mode.Ex, mode.Ey], axis=0).astype(mode_dtype),
+            np.stack([mode.Hz, mode.Hx, mode.Hy], axis=0).astype(mode_dtype),
+        )
+    elif propagation_axis == 1:
+        mode_E, mode_H = (
+            np.stack([mode.Ex, mode.Ez, mode.Ey], axis=0).astype(mode_dtype),
+            -np.stack([mode.Hx, mode.Hz, mode.Hy], axis=0).astype(mode_dtype),
+        )
+    elif propagation_axis == 2:
+        mode_E, mode_H = (
+            np.stack([mode.Ex, mode.Ey, mode.Ez], axis=0).astype(mode_dtype),
+            np.stack([mode.Hx, mode.Hy, mode.Hz], axis=0).astype(mode_dtype),
+        )
+    else:
+        raise Exception("This should never happen")
+
+    neff = np.asarray(mode.neff).astype(mode_dtype)
+    return mode_E, mode_H, neff
+
+
+# Off-diagonal magnitude above which tidy3d treats eps/mu as tensorial (tidy3d's TOL_TENSORIAL).
+_TOL_TENSORIAL = 1e-6
+
+
+def _is_diagonal_cross_section(permittivity, permeability) -> bool:
+    """Whether tidy3d would solve this cross-section with its diagonal solver.
+
+    Mirrors tidy3d's own test: a 1- or 3-component (or scalar) material is diagonal, and a 9-component one is
+    diagonal when every off-diagonal entry is at most :data:`_TOL_TENSORIAL` in magnitude.
+    """
+
+    def diagonal(material) -> bool:
+        material = np.asarray(material)
+        if material.ndim == 0 or material.shape[0] in (1, 3):
+            return True
+        return bool(np.all(np.abs(material[[1, 2, 3, 5, 6, 7]]) <= _TOL_TENSORIAL))
+
+    return diagonal(permittivity) and diagonal(permeability)
+
+
+def _backward_mode(mode: ModeTupleType) -> ModeTupleType:
+    """The backward ("-") mode tidy3d returns for a forward ("+") mode on a diagonal cross-section.
+
+    For diagonal permittivity and permeability, tidy3d solves "-" as the "+" eigenvector with Hx, Hy and Ez negated
+    (tidy3d frame, propagation along z) and the same effective index, then re-normalizes so the mode's bi-orthogonal
+    self-dot is 1. The negation turns the "+" mode's self-dot of 1 into -1, so the re-normalization multiplies by
+    1/sqrt(-1) = -1j. tidy3d applies the same steps to its raw eigenvector, whose arbitrary phase decides the branch
+    of that square root, so a solved "-" mode equals this one up to an overall sign, like any eigenvector.
+    """
+    phase = -1j
+    return ModeTupleType(
+        neff=mode.neff,
+        Ex=mode.Ex * phase,
+        Ey=mode.Ey * phase,
+        Ez=-mode.Ez * phase,
+        Hx=-mode.Hx * phase,
+        Hy=-mode.Hy * phase,
+        Hz=mode.Hz * phase,
+    )
+
+
+def _check_polarization_count(
+    modes: list[ModeTupleType],
+    filter_pol: Literal["te", "tm"],
+    mode_indices: tuple[int, ...],
+) -> None:
+    """Raise if a requested index would land past the modes of the requested polarization.
+
+    :func:`sort_modes` puts the matching modes first and the rest after them, so an index past the matching modes
+    would silently return a mode of the other polarization.
+    """
+    matching = sum(compute_mode_polarization_fraction(mode, (0, 1), filter_pol) >= 0.5 for mode in modes)
+    if max(mode_indices) >= matching:
+        raise ValueError(
+            f"Mode index {max(mode_indices)} with filter_pol={filter_pol!r} needs {max(mode_indices) + 1} "
+            f"{filter_pol.upper()} modes, but only {matching} of the {len(modes)} solved modes are {filter_pol.upper()}."
+        )
 
 
 def tidy3d_mode_computation_wrapper(
