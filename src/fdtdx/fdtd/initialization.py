@@ -101,6 +101,8 @@ def place_objects(
     config: SimulationConfig,
     constraints: Sequence[AnyConstraint],
     key: jax.Array | None = None,
+    precomputed_inv_permittivities: jax.Array | None = None,  # XANADU: precomputed materials
+    precomputed_electric_conductivity: jax.Array | None = None,  # XANADU: precomputed materials
 ) -> tuple[
     ObjectContainer,
     ArrayContainer,
@@ -116,6 +118,13 @@ def place_objects(
         constraints (Sequence[Constraint]): List of positioning/sizing constraints referencing object names.
         key (jax.Array | None): JAX random key for initialization.  When ``None``
             (the default) a deterministic key is derived from ``_DEFAULT_KEY_SEED``.
+        precomputed_inv_permittivities (jax.Array | None): XANADU. Inverse permittivity of the whole
+            volume, shape ``(C, Nx, Ny, Nz)`` with ``C`` in 1, 3 or 9, used as given (no copy, cast or
+            smoothing) instead of rasterizing material objects. For callers that build their own
+            materials, including any subpixel averaging. Sources and detectors are applied against it.
+        precomputed_electric_conductivity (jax.Array | None): XANADU. Electric conductivity of the
+            whole volume, same layout, already multiplied by the grid spacing (``c0 * dt / courant``),
+            used as given.
 
     Returns:
         tuple[ObjectContainer, ArrayContainer, ParameterContainer, SimulationConfig, dict[str, Any]]:
@@ -276,7 +285,12 @@ def place_objects(
     assert key is not None
     key, subkey = jax.random.split(key)
     params = _init_params(objects=objects_container, key=subkey)
-    arrays, config, info = _init_arrays(objects=objects_container, config=config)
+    arrays, config, info = _init_arrays(
+        objects=objects_container,
+        config=config,
+        precomputed_inv_permittivities=precomputed_inv_permittivities,
+        precomputed_electric_conductivity=precomputed_electric_conductivity,
+    )
 
     # Step 11: Update object configs and apply objects if possible
     disp_c1 = None if arrays.dispersive_c1 is None else jax.lax.stop_gradient(arrays.dispersive_c1)
@@ -497,9 +511,43 @@ def apply_params(
     return arrays, new_objects, info
 
 
+def _check_precomputed_materials(  # XANADU: precomputed materials
+    objects: ObjectContainer,
+    volume_shape: tuple[int, int, int],
+    inv_permittivities: jax.Array | None,
+    electric_conductivity: jax.Array | None,
+) -> None:
+    """Reject precomputed material arrays that fdtdx would misread, smooth again or silently override."""
+    for name, array in (
+        ("precomputed_inv_permittivities", inv_permittivities),
+        ("precomputed_electric_conductivity", electric_conductivity),
+    ):
+        if array is None:
+            continue
+        if array.ndim != 4 or array.shape[0] not in (1, 3, 9) or tuple(array.shape[1:]) != tuple(volume_shape):
+            raise ValueError(f"{name} must have shape (1|3|9, *{tuple(volume_shape)}), got {tuple(array.shape)}.")
+    if objects.any_object_subpixel_smoothing:
+        raise ValueError(
+            "Precomputed material arrays already include the caller's subpixel averaging; they can't be combined "
+            "with subpixel_smoothing=True on an object, which would average a second time."
+        )
+    others = [o.name for o in objects.static_material_objects if o.name != objects.volume.name]
+    if others:
+        raise ValueError(
+            "Precomputed material arrays replace the material of every static material object, so these objects "
+            f"would be silently ignored: {others}. Include them in the precomputed arrays instead."
+        )
+    if objects.max_num_dispersive_poles > 0:
+        raise ValueError(
+            "Precomputed material arrays carry no dispersion coefficients; remove the dispersive material."
+        )
+
+
 def _init_arrays(
     objects: ObjectContainer,
     config: SimulationConfig,
+    precomputed_inv_permittivities: jax.Array | None = None,  # XANADU: precomputed materials
+    precomputed_electric_conductivity: jax.Array | None = None,  # XANADU: precomputed materials
 ) -> tuple[ArrayContainer, SimulationConfig, dict[str, Any]]:
     """Initializes field arrays and material properties for the simulation.
 
@@ -510,6 +558,8 @@ def _init_arrays(
     Args:
         objects (ObjectContainer): Container with simulation objects
         config (SimulationConfig): The simulation configuration
+        precomputed_inv_permittivities (jax.Array | None): XANADU. See :func:`place_objects`.
+        precomputed_electric_conductivity (jax.Array | None): XANADU. See :func:`place_objects`.
 
     Returns:
         tuple[ArrayContainer, SimulationConfig, dict[str, Any]]: A tuple containing:
@@ -611,6 +661,13 @@ def _init_arrays(
         isotropic_permittivity = False
         diagonally_anisotropic_permittivity = not subpixel_full_tensor
 
+    # XANADU: precomputed materials. The caller supplies the whole volume's materials, including any
+    # subpixel averaging, and they are used exactly as given below.
+    if precomputed_inv_permittivities is not None or precomputed_electric_conductivity is not None:
+        _check_precomputed_materials(
+            objects, volume_shape, precomputed_inv_permittivities, precomputed_electric_conductivity
+        )
+
     # Dispersion tiers. The recurrence coefficients c1/c2 carry 1 (isotropic,
     # broadcast) or 3 (per-axis) components; the field coupling c3
     # additionally widens to 9 (row-major 3x3 tensor per pole) when any pole is
@@ -683,13 +740,16 @@ def _init_arrays(
         num_magnetic_cond_components = 9
 
     # permittivity - shape (1, Nx, Ny, Nz) for isotropic, (3, Nx, Ny, Nz) for diagonally anisotropic, (9, Nx, Ny, Nz) for fully anisotropic
-    inv_permittivities = create_named_sharded_matrix(
-        (num_perm_components, *volume_shape),
-        value=0.0,
-        dtype=config.dtype,
-        sharding_axis=1,
-        backend=config.backend,
-    )
+    if precomputed_inv_permittivities is not None:  # XANADU: precomputed materials, no second full-grid array
+        inv_permittivities = precomputed_inv_permittivities
+    else:
+        inv_permittivities = create_named_sharded_matrix(
+            (num_perm_components, *volume_shape),
+            value=0.0,
+            dtype=config.dtype,
+            sharding_axis=1,
+            backend=config.backend,
+        )
 
     # permeability - scalar 1.0 if non-magnetic, else (1, Nx, Ny, Nz) for isotropic, (3, Nx, Ny, Nz) for diagonally anisotropic, (9, Nx, Ny, Nz) for fully anisotropic
     if objects.all_objects_non_magnetic:
@@ -705,7 +765,9 @@ def _init_arrays(
 
     # electric conductivity - None if non-conductive, else (1, Nx, Ny, Nz) for isotropic, (3, Nx, Ny, Nz) for diagonally anisotropic, (9, Nx, Ny, Nz) for fully anisotropic
     electric_conductivity = None
-    if not objects.all_objects_non_electrically_conductive:
+    if precomputed_electric_conductivity is not None:  # XANADU: precomputed materials, already scaled
+        electric_conductivity = precomputed_electric_conductivity
+    elif not objects.all_objects_non_electrically_conductive:
         electric_conductivity = create_named_sharded_matrix(
             (num_electric_cond_components, *volume_shape),
             value=0.0,
@@ -782,7 +844,9 @@ def _init_arrays(
             # Material properties are tuples (εxx, εxy, εxz, εyx, εyy, εyz, εzx, εzy, εzz)
             # Arrays have shape (num_components, Nx, Ny, Nz) where num_components is 1 (isotropic), 3 (diagonally anisotropic), or 9 (fully anisotropic)
 
-            if num_perm_components == 1:
+            if precomputed_inv_permittivities is not None:  # XANADU: used as given, the volume writes nothing
+                pass
+            elif num_perm_components == 1:
                 # Isotropic: simple element-wise inversion
                 perm_tuple = (o.material.permittivity[0],)
                 inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
@@ -831,7 +895,7 @@ def _init_arrays(
                         inv_permeabilities, (slice(None), *o.grid_slice), inv_obj_permeability
                     )
 
-            if electric_conductivity is not None:
+            if electric_conductivity is not None and precomputed_electric_conductivity is None:  # XANADU
                 if num_electric_cond_components == 1:
                     # Isotropic
                     cond_tuple = (o.material.electric_conductivity[0],)
