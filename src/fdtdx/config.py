@@ -162,6 +162,12 @@ class SimulationConfig(TreeClass):
     #:  Data type for numerical computations. Defaults to jnp.float32.
     dtype: jnp.dtype = frozen_field(default=jnp.float32)
 
+    #: XANADU: mixed precision. Data type of the full-grid material arrays (permittivity,
+    #: permeability, conductivity). They are read fresh every step rather than accumulated, so with
+    #: ``dtype=jnp.float64`` (fields, PML, sources, mode solves) they can stay float32 for half the
+    #: memory. None (default) follows ``dtype``.
+    material_dtype: jnp.dtype | None = frozen_field(default=None)
+
     #: Whether to use complex-valued field arrays.
     #: None (default): auto-detect based on boundary conditions (e.g. Bloch).
     #: True: force complex fields (complex64 if dtype=float32, complex128 if dtype=float64).
@@ -204,6 +210,9 @@ class SimulationConfig(TreeClass):
                 f"config.symmetry must be a length-3 tuple with each entry in {{-1, 0, +1}} "
                 f"(0=none, -1=PEC, +1=PMC), got {self.symmetry!r}"
             )
+
+        if self.material_dtype is None:  # XANADU: mixed precision
+            self.material_dtype = self.dtype
 
         current_platform = extend.backend.get_backend().platform
 

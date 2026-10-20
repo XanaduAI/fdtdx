@@ -119,9 +119,10 @@ def place_objects(
         key (jax.Array | None): JAX random key for initialization.  When ``None``
             (the default) a deterministic key is derived from ``_DEFAULT_KEY_SEED``.
         precomputed_inv_permittivities (jax.Array | None): XANADU. Inverse permittivity of the whole
-            volume, shape ``(C, Nx, Ny, Nz)`` with ``C`` in 1, 3 or 9, used as given (no copy, cast or
-            smoothing) instead of rasterizing material objects. For callers that build their own
-            materials, including any subpixel averaging. Sources and detectors are applied against it.
+            volume, shape ``(C, Nx, Ny, Nz)`` with ``C`` in 1, 3 or 9 and dtype ``config.material_dtype``,
+            used as given (no copy, cast or smoothing) instead of rasterizing material objects. For callers
+            that build their own materials, including any subpixel averaging. Sources and detectors are
+            applied against it.
         precomputed_electric_conductivity (jax.Array | None): XANADU. Electric conductivity of the
             whole volume, same layout, already multiplied by the grid spacing (``c0 * dt / courant``),
             used as given.
@@ -516,6 +517,7 @@ def _check_precomputed_materials(  # XANADU: precomputed materials
     volume_shape: tuple[int, int, int],
     inv_permittivities: jax.Array | None,
     electric_conductivity: jax.Array | None,
+    material_dtype: jnp.dtype,
 ) -> None:
     """Reject precomputed material arrays that fdtdx would misread, smooth again or silently override."""
     for name, array in (
@@ -526,6 +528,11 @@ def _check_precomputed_materials(  # XANADU: precomputed materials
             continue
         if array.ndim != 4 or array.shape[0] not in (1, 3, 9) or tuple(array.shape[1:]) != tuple(volume_shape):
             raise ValueError(f"{name} must have shape (1|3|9, *{tuple(volume_shape)}), got {tuple(array.shape)}.")
+        if array.dtype != material_dtype:
+            raise ValueError(
+                f"{name} has dtype {array.dtype} but config.material_dtype is {jnp.dtype(material_dtype)}; "
+                "cast it or set material_dtype to match."
+            )
     if objects.any_object_subpixel_smoothing:
         raise ValueError(
             "Precomputed material arrays already include the caller's subpixel averaging; they can't be combined "
@@ -661,11 +668,21 @@ def _init_arrays(
         isotropic_permittivity = False
         diagonally_anisotropic_permittivity = not subpixel_full_tensor
 
+    # XANADU: mixed precision, materials may be narrower than fields. SimulationConfig already resolves
+    # None to dtype; repeating it here narrows the type.
+    material_dtype = config.material_dtype
+    if material_dtype is None:
+        material_dtype = config.dtype
+
     # XANADU: precomputed materials. The caller supplies the whole volume's materials, including any
     # subpixel averaging, and they are used exactly as given below.
     if precomputed_inv_permittivities is not None or precomputed_electric_conductivity is not None:
         _check_precomputed_materials(
-            objects, volume_shape, precomputed_inv_permittivities, precomputed_electric_conductivity
+            objects,
+            volume_shape,
+            precomputed_inv_permittivities,
+            precomputed_electric_conductivity,
+            material_dtype,
         )
 
     # Dispersion tiers. The recurrence coefficients c1/c2 carry 1 (isotropic,
@@ -746,7 +763,7 @@ def _init_arrays(
         inv_permittivities = create_named_sharded_matrix(
             (num_perm_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -758,7 +775,7 @@ def _init_arrays(
         inv_permeabilities = create_named_sharded_matrix(
             (num_permeability_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -771,7 +788,7 @@ def _init_arrays(
         electric_conductivity = create_named_sharded_matrix(
             (num_electric_cond_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -782,7 +799,7 @@ def _init_arrays(
         magnetic_conductivity = create_named_sharded_matrix(
             (num_magnetic_cond_components, *volume_shape),
             value=0.0,
-            dtype=config.dtype,
+            dtype=material_dtype,
             sharding_axis=1,
             backend=config.backend,
         )
@@ -849,21 +866,21 @@ def _init_arrays(
             elif num_perm_components == 1:
                 # Isotropic: simple element-wise inversion
                 perm_tuple = (o.material.permittivity[0],)
-                inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=material_dtype))[:, None, None, None]
                 inv_permittivities = sharding_preserving_set(
                     inv_permittivities, (slice(None), *o.grid_slice), inv_obj_permittivity
                 )
             elif num_perm_components == 3:
                 # Diagonally anisotropic: simple element-wise inversion
                 perm_tuple = (o.material.permittivity[0], o.material.permittivity[4], o.material.permittivity[8])
-                inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                inv_obj_permittivity = (1 / jnp.array(perm_tuple, dtype=material_dtype))[:, None, None, None]
                 inv_permittivities = sharding_preserving_set(
                     inv_permittivities, (slice(None), *o.grid_slice), inv_obj_permittivity
                 )
             else:
                 # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
                 perm_tuple = o.material.permittivity
-                perm_matrix = jnp.array(perm_tuple, dtype=config.dtype).reshape(3, 3)
+                perm_matrix = jnp.array(perm_tuple, dtype=material_dtype).reshape(3, 3)
                 inv_perm_matrix = jnp.linalg.inv(perm_matrix)
                 inv_obj_permittivity = inv_perm_matrix.flatten()[:, None, None, None]
                 inv_permittivities = sharding_preserving_set(
@@ -874,21 +891,21 @@ def _init_arrays(
                 if num_permeability_components == 1:
                     # Isotropic: simple element-wise inversion
                     perm_tuple = (o.material.permeability[0],)
-                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=material_dtype))[:, None, None, None]
                     inv_permeabilities = sharding_preserving_set(
                         inv_permeabilities, (slice(None), *o.grid_slice), inv_obj_permeability
                     )
                 elif num_permeability_components == 3:
                     # Diagonally anisotropic: simple element-wise inversion
                     perm_tuple = (o.material.permeability[0], o.material.permeability[4], o.material.permeability[8])
-                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=config.dtype))[:, None, None, None]
+                    inv_obj_permeability = (1 / jnp.array(perm_tuple, dtype=material_dtype))[:, None, None, None]
                     inv_permeabilities = sharding_preserving_set(
                         inv_permeabilities, (slice(None), *o.grid_slice), inv_obj_permeability
                     )
                 else:
                     # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
                     perm_tuple = o.material.permeability
-                    perm_matrix = jnp.array(perm_tuple, dtype=config.dtype).reshape(3, 3)
+                    perm_matrix = jnp.array(perm_tuple, dtype=material_dtype).reshape(3, 3)
                     inv_perm_matrix = jnp.linalg.inv(perm_matrix)
                     inv_obj_permeability = inv_perm_matrix.flatten()[:, None, None, None]
                     inv_permeabilities = sharding_preserving_set(
@@ -914,7 +931,7 @@ def _init_arrays(
                 # On uniform grids this equals the scalar grid spacing.  On stretched
                 # grids it is the reference spacing implied by ``c0 * dt / courant``.
                 assert conductivity_spacing is not None
-                obj_electric_conductivity = (jnp.array(cond_tuple, dtype=config.dtype) * conductivity_spacing)[
+                obj_electric_conductivity = (jnp.array(cond_tuple, dtype=material_dtype) * conductivity_spacing)[
                     :, None, None, None
                 ]
                 electric_conductivity = sharding_preserving_set(
@@ -938,7 +955,7 @@ def _init_arrays(
 
                 # Scale physical conductivity into the dimensionless update coefficient.
                 assert conductivity_spacing is not None
-                obj_magnetic_conductivity = (jnp.array(cond_tuple, dtype=config.dtype) * conductivity_spacing)[
+                obj_magnetic_conductivity = (jnp.array(cond_tuple, dtype=material_dtype) * conductivity_spacing)[
                     :, None, None, None
                 ]
                 magnetic_conductivity = sharding_preserving_set(

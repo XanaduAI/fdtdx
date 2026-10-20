@@ -107,7 +107,9 @@ class PerfectlyMatchedLayer(BaseBoundary):
             assert self.sigma_order is not None, "sigma_order should be set by __post_init__"
             pml_thickness = self._physical_thickness()
             sigma_end_calculated = -(self.sigma_order + 1) * jnp.log(1e-6) / (2 * (eta0 / 1.0) * pml_thickness)
-            self = self.aset("sigma_end", sigma_end_calculated.astype(float))
+            # XANADU: x64 dtypes. float() as the field is typed: .astype(float) gave a strongly typed float64
+            # array under jax x64, which promoted the PML coefficients and psi of a float32 run.
+            self = self.aset("sigma_end", float(sigma_end_calculated))
 
         dtype = config.dtype
         dt = config.time_step_duration
