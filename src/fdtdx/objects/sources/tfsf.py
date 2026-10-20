@@ -285,7 +285,9 @@ def _tfsf_inject_E_face(
 
         for row in (normal_axis, a_axis, b_axis):
             correction = c * (get_inv_eps(row, a_axis) * (+H_b_inc) + get_inv_eps(row, b_axis) * (-H_a_inc))
-            E = E.at[row, *grid_slice].add(sign * correction)
+            # XANADU: x64 dtypes. Cast the plane-sized increment, as source.py does, so a float64 source never
+            # promotes a float32 field to a full-grid float64 copy for the add.
+            E = E.at[row, *grid_slice].add((sign * correction).astype(E.dtype))
         return E
 
     else:
@@ -297,8 +299,10 @@ def _tfsf_inject_E_face(
         H_a_inc = H_a_inc * c * inv_permittivity_slice[b_axis]
         H_a_inc = jax.lax.stop_gradient(H_a_inc)
 
-        E = E.at[a_axis, *grid_slice].add(sign * H_b_inc)
-        E = E.at[b_axis, *grid_slice].add(-sign * H_a_inc)
+        # XANADU: x64 dtypes. Cast the plane-sized increment, as source.py does, so a float64 source never
+        # promotes a float32 field to a full-grid float64 copy for the add.
+        E = E.at[a_axis, *grid_slice].add((sign * H_b_inc).astype(E.dtype))
+        E = E.at[b_axis, *grid_slice].add((-sign * H_a_inc).astype(E.dtype))
         return E
 
 
@@ -380,7 +384,7 @@ def _tfsf_inject_H_face(
 
         for row in (normal_axis, a_axis, b_axis):
             correction = c * (get_inv_mu(row, a_axis) * (-E_b_inc) + get_inv_mu(row, b_axis) * (+E_a_inc))
-            H = H.at[row, *grid_slice].add(sign * correction)
+            H = H.at[row, *grid_slice].add((sign * correction).astype(H.dtype))  # XANADU: x64 dtypes, as for E
         return H
 
     else:
@@ -398,8 +402,9 @@ def _tfsf_inject_H_face(
             E_b_inc = E_b_inc * c * inv_permeability_slice
         E_b_inc = jax.lax.stop_gradient(E_b_inc)
 
-        H = H.at[b_axis, *grid_slice].add(sign * E_a_inc)
-        H = H.at[a_axis, *grid_slice].add(-sign * E_b_inc)
+        # XANADU: x64 dtypes, cast as for E above.
+        H = H.at[b_axis, *grid_slice].add((sign * E_a_inc).astype(H.dtype))
+        H = H.at[a_axis, *grid_slice].add((-sign * E_b_inc).astype(H.dtype))
         return H
 
 

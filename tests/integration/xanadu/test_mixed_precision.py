@@ -118,12 +118,37 @@ def test_float64_accumulators_float32_materials(precomputed):
         assert float(jnp.abs(out.fields.E).max()) > 0
 
 
+def _full_grid_64bit_values(container, arrays, config):
+    """(primitive, dtype) of every 64-bit field-sized value in the traced time loop."""
+    jaxpr = jax.make_jaxpr(lambda a: _run(container, a, config))(arrays).jaxpr
+    found = []
+
+    def walk(jaxpr):
+        for eqn in jaxpr.eqns:
+            for v in eqn.outvars:
+                if v.aval.shape == arrays.fields.E.shape and v.aval.dtype in (jnp.float64, jnp.complex128):
+                    found.append((eqn.primitive.name, str(v.aval.dtype)))
+            for param in eqn.params.values():
+                for sub in param if isinstance(param, (list, tuple)) else (param,):
+                    if isinstance(sub, jax.extend.core.ClosedJaxpr):
+                        walk(sub.jaxpr)
+                    elif isinstance(sub, jax.extend.core.Jaxpr):
+                        walk(sub)
+
+    walk(jaxpr)
+    return found
+
+
 def test_float32_run_stays_float32_under_x64():
     # Upstream promoted the PML coefficients to float64 under x64 and the time loop failed on the psi dtype.
     with jax.enable_x64(True):
         container, arrays, config = _place(*_build(jnp.float32, None, _core()))
         for pml in container.pml_objects:
             assert pml.pml_a_E.dtype == pml.pml_b_E.dtype == jnp.float32
+        # The lossy mode source is complex128 even here; its increments must not promote E/H for the add.
+        src = next(o for o in container.objects if o.name == "src")
+        assert src._E.dtype == jnp.complex128
+        assert _full_grid_64bit_values(container, arrays, config) == []
         out = _run(container, arrays, config)
         assert all(a.dtype == jnp.float32 for a in _accumulators(out))
         assert out.inv_permittivities.dtype == jnp.float32
