@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from fdtdx.config import SimulationConfig
 from fdtdx.constants import eta0
 from fdtdx.core.misc import expand_to_3x3, pad_fields
-from fdtdx.core.physics.curl import curl_E, curl_H, interpolate_fields
+from fdtdx.core.physics.curl import curl_E, curl_H, interpolate_fields, interpolate_fields_along_normal
 from fdtdx.core.physics.symmetry import field_component_parity, mirror_pairs_on_plane
 from fdtdx.core.switch import OnOffSwitch
 from fdtdx.fdtd.container import ArrayContainer, ObjectContainer
@@ -1017,6 +1017,36 @@ def _check_updated_state_layout(detector: Detector, old: DetectorState, new: Det
         )
 
 
+def _colocate_along_normal(  # XANADU: normal-axis co-location
+    E: jax.Array,
+    H: jax.Array,
+    H_prev: jax.Array,
+    detector: Detector,
+    objects: ObjectContainer,
+    config: SimulationConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """XANADU: a detector's fields co-located along its normal only, see ``Detector.normal_axis_interpolation``.
+
+    The stencil reads one cell below the detector along its normal. At the domain edge that cell comes from the
+    boundary padding, as in the full co-location.
+    """
+    if config.has_symmetry:
+        raise NotImplementedError(
+            f"Detector '{detector.name}': normal_axis_interpolation is not supported with config.symmetry."
+        )
+    axis = min(range(3), key=lambda a: detector.grid_shape[a])
+    region = detector.grid_slice_tuple
+    if region[axis][0] >= 1:
+        block = (slice(None), *(slice(s - 1 if a == axis else s, e) for a, (s, e) in enumerate(region)))
+        E_block, H_block = E[block], (H_prev[block] + H[block]) / 2
+    else:
+        # Padded index = domain index + 1.
+        block = (slice(None), *(slice(s if a == axis else s + 1, e + 1) for a, (s, e) in enumerate(region)))
+        E_block = pad_fields_with_symmetry_mirror(E, objects, config, "E")[block]
+        H_block = pad_fields_with_symmetry_mirror((H_prev + H) / 2, objects, config, "H")[block]
+    return interpolate_fields_along_normal(E_block, H_block, axis, config=config, region_slice=region)
+
+
 def update_detector_states(
     time_step: jax.Array,
     arrays: ArrayContainer,
@@ -1062,7 +1092,10 @@ def update_detector_states(
 
     # The full-domain interpolation is only needed for exact detectors whose stencil reaches a domain edge.
     full = None
-    if any(d.exact_interpolation and not is_interior(d) for d in to_update):
+    if any(
+        d.exact_interpolation and d.normal_axis_interpolation is not True and not is_interior(d)  # XANADU
+        for d in to_update
+    ):
         full = interpolate_fields(
             E_pad=pad_fields_with_symmetry_mirror(arrays.fields.E, objects, config, "E"),
             H_pad=pad_fields_with_symmetry_mirror((H_prev + arrays.fields.H) / 2, objects, config, "H"),
@@ -1073,6 +1106,8 @@ def update_detector_states(
         gs = detector.grid_slice
         if not detector.exact_interpolation:
             E_reg, H_reg = E[:, *gs], H[:, *gs]
+        elif detector.normal_axis_interpolation is True:  # XANADU: normal-axis co-location (a bool, not a mock)
+            E_reg, H_reg = _colocate_along_normal(E, H, H_prev, detector, objects, config)
         elif is_interior(detector):
             block = (slice(None), *(slice(s - 1, e + 1) for (s, e) in detector.grid_slice_tuple))
             H_avg = (H_prev[block] + H[block]) / 2

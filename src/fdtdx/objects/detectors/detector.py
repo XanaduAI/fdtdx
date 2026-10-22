@@ -35,6 +35,12 @@ class Detector(SimulationObject, ABC):
     #: Whether to use exact field interpolation. Defaults to True.
     exact_interpolation: bool = frozen_field(default=True)
 
+    #: XANADU: normal-axis co-location. With ``exact_interpolation``, co-locate E and H only along the detector's
+    #: normal (its thinnest axis) instead of onto the E_z point: each component keeps its own transverse Yee
+    #: position, as in the mode solver, so fields are never averaged across waveguide walls. Not supported with
+    #: ``config.symmetry``. Defaults to False.
+    normal_axis_interpolation: bool = frozen_field(default=False)
+
     #: Whether to record fields in inverse time order. Defaults to false.
     inverse: bool = frozen_field(default=False)
 

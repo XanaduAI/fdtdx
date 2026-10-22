@@ -83,6 +83,48 @@ def _backward_edge_average(
     return (current * previous_half_width + previous * current_half_width) / (current_half_width + previous_half_width)
 
 
+def interpolate_fields_along_normal(  # XANADU: normal-axis co-location
+    E_block: jax.Array,
+    H_block: jax.Array,
+    axis: int,
+    config: SimulationConfig | None = None,
+    region_slice: SliceTuple3D | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """XANADU: co-locates E and H on a detector plane along its normal axis only.
+
+    :func:`interpolate_fields` also averages each component with its transverse neighbours, which smears the
+    fields across waveguide walls, differently for ports of different shapes. Here every component keeps its own
+    transverse Yee position, the one the mode solver uses, and only the components sampled half a cell off the
+    plane are averaged onto it: the normal E component and the two tangential H components, between cell ``i``
+    and cell ``i - 1`` along ``axis``. The plane is the lower face of the detector cells along ``axis``.
+
+    Args:
+        E_block: Electric field of shape (3, ...) covering the detector region plus one cell below it along
+            ``axis``.
+        H_block: Time-centred magnetic field over the same block.
+        axis: The detector's normal axis.
+        config: Optional simulation configuration; non-uniform grids weight the averages by cell widths.
+        region_slice: The detector's grid slice, for those weights.
+
+    Returns:
+        Tuple of (E_interp, H_interp) over the detector region.
+    """
+    current = tuple(slice(1, None) if a == axis else slice(None) for a in range(3))
+    previous = tuple(slice(None, -1) if a == axis else slice(None) for a in range(3))
+
+    def colocate(field: jax.Array, averaged: tuple[int, ...]) -> jax.Array:
+        return jnp.stack(
+            [
+                _backward_edge_average(field[c][current], field[c][previous], config, axis, region_slice)
+                if c in averaged
+                else field[c][current]
+                for c in range(3)
+            ]
+        )
+
+    return colocate(E_block, (axis,)), colocate(H_block, tuple(c for c in range(3) if c != axis))
+
+
 def interpolate_fields(
     E_pad: jax.Array,
     H_pad: jax.Array,
