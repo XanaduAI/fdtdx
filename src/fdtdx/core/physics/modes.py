@@ -1,3 +1,4 @@
+import hashlib
 from collections import namedtuple
 from types import SimpleNamespace
 from typing import List, Literal, Sequence
@@ -111,6 +112,7 @@ def compute_mode(
     bend_axis: int | None = None,
     symmetry: tuple[int, int] = (0, 0),
     transverse_coords: Sequence[jax.Array] | None = None,
+    num_modes: int | None = None,  # XANADU: mode-solve reuse
 ) -> tuple[
     jax.Array,  # E
     jax.Array,  # H
@@ -152,10 +154,18 @@ def compute_mode(
             When provided, the Tidy3D mode solver receives the non-uniform rectilinear grid directly.
             JAX arrays are accepted; the numpy conversion happens inside the tidy3d callback so the function
             remains compatible with ``jax.jit``.
+        num_modes (int | None, optional): XANADU. Number of modes the solver is asked for before sorting and
+            indexing. Defaults to None, meaning ``2 * (mode_index + 1) + 10``. Callers that want several mode
+            indices and both directions of one plane pass the same value (from the largest index) to every call:
+            the forward solve is then shared, because the last one is reused when the same plane is solved again.
 
     Returns:
         Tuple[jax.Array, jax.Array, jax.Array]:
             Tuple of E, H field and the effective index as complex-valued jax arrays.
+
+    Raises:
+        ValueError: XANADU. If ``filter_pol`` is given and the solve holds fewer modes of that polarization than
+            ``mode_index`` needs; the sorted list would otherwise silently return a mode of the other polarization.
     """
     # Input validation
     if (
@@ -171,6 +181,10 @@ def compute_mode(
             raise Exception(f"Invalid shape of inv_permeabilities: {inv_permeabilities.shape}")
     if (bend_radius is None) != (bend_axis is None):
         raise ValueError("bend_radius and bend_axis must both be set or both be None")
+    if num_modes is None:  # XANADU: mode-solve reuse
+        num_modes = 2 * (mode_index + 1) + 10
+    elif num_modes <= mode_index:
+        raise ValueError(f"num_modes={num_modes} must exceed mode_index={mode_index}")
 
     np_complex_dtype = np.complex128 if dtype == jnp.float64 else np.complex64
 
@@ -212,7 +226,7 @@ def compute_mode(
             permeability_cross_section=permeability,
             coords=coords,
             direction=direction,
-            num_modes=2 * (mode_index + 1) + 10,
+            num_modes=num_modes,  # XANADU: mode-solve reuse
             bend_radius=bend_radius_um,
             bend_axis=tidy3d_bend_axis,
             plane_center=plane_center,
@@ -222,6 +236,14 @@ def compute_mode(
         # sort modes by polarization
         # tidy3d assumes propagation in the z-direction. The tangential axes are therefore x and y.
         modes = sort_modes(modes, filter_pol, (0, 1))
+        if filter_pol is not None:  # XANADU: no silent fallback to the other polarization
+            matching = sum(compute_mode_polarization_fraction(m, (0, 1), filter_pol) >= 0.5 for m in modes)
+            if mode_index >= matching:
+                raise ValueError(
+                    f"Mode index {mode_index} with filter_pol={filter_pol!r} needs {mode_index + 1} "
+                    f"{filter_pol.upper()} modes, but only {matching} of the {len(modes)} solved modes are "
+                    f"{filter_pol.upper()}."
+                )
         mode = modes[mode_index]
 
         if propagation_axis == 0:
@@ -576,6 +598,50 @@ def _is_reciprocal_tensor(components: Sequence[ArrayLike], tol: float = 1e-6) ->
     )
 
 
+_last_forward_solve: dict = {}  # XANADU: mode-solve reuse, holds the "key" and "result" of the last solve
+
+
+def _solve_forward_modes(eps_cross, coords, freq, precision, mode_spec, mu_cross, plane_center, symmetry):
+    """XANADU: mode-solve reuse. The forward tidy3d solve, reused while the same plane is solved again.
+
+    Only the last solve is kept, so asking for several mode indices and both directions of one plane in a row
+    (with the same ``num_modes``) costs one solve. The result is identical to solving again; it is made read-only
+    so no caller can change it for the next one.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for array in (*eps_cross, *(mu_cross or ()), *coords):
+        array = np.ascontiguousarray(array)
+        digest.update(f"{array.dtype}{array.shape}".encode())
+        digest.update(array.tobytes())
+    key = (
+        digest.hexdigest(),
+        mu_cross is None,
+        float(freq),
+        precision,
+        tuple(sorted(vars(mode_spec).items())),
+        None if plane_center is None else tuple(float(c) for c in plane_center),
+        tuple(int(s) for s in symmetry),
+    )
+    if _last_forward_solve.get("key") != key:
+        _last_forward_solve.clear()
+        EH, neffs, _ = _compute_modes(
+            eps_cross=eps_cross,
+            coords=coords,
+            freq=freq,
+            precision=precision,
+            mode_spec=mode_spec,
+            direction="+",
+            mu_cross=mu_cross,
+            plane_center=plane_center,
+            symmetry=symmetry,
+        )
+        for array in (EH, neffs):
+            if isinstance(array, np.ndarray):
+                array.setflags(write=False)
+        _last_forward_solve.update(key=key, result=(EH, neffs))
+    return _last_forward_solve["result"]
+
+
 def tidy3d_mode_computation_wrapper(
     frequency: float,
     permittivity_cross_section: ArrayLike,
@@ -684,13 +750,12 @@ def tidy3d_mode_computation_wrapper(
 
     # Always solve forward: tidy3d >= 2.9 normalizes backward modes with a 1/sqrt of their
     # negative self-flux, tainting them with a spurious global phase of +-i.
-    EH, neffs, _ = _compute_modes(
+    EH, neffs = _solve_forward_modes(  # XANADU: mode-solve reuse
         eps_cross=eps_cross,
         coords=coords,
         freq=frequency,
         precision=precision,
         mode_spec=mode_spec,
-        direction="+",
         mu_cross=mu_cross,
         plane_center=plane_center,
         symmetry=symmetry,
@@ -710,7 +775,7 @@ def tidy3d_mode_computation_wrapper(
                 Hx=Hx,
                 Hy=Hy,
                 Hz=Hz,
-                neff=float(neffs.real) + 1j * float(neffs.imag),
+                neff=complex(np.asarray(neffs).reshape(-1)[0]),  # XANADU: tidy3d gives shape (1,), not a scalar
             )
             for _ in range(num_modes)
         ]
