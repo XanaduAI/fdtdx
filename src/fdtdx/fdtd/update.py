@@ -297,17 +297,14 @@ def update_E(
 
     if not inv_eps_is_full_tensor and not sigma_E_is_full_tensor:
         # Isotropic and diagonal anisotropic case
-        factor = 1
-        if sigma_E is not None:
-            # update formula for lossy material. Simplifies to Noop for conductivity = 0
-            # for details see Schneider, chapter 3.12
-            # Component-wise multiplication: sigma_E[i, x, y, z] * inv_eps[i, x, y, z]
-            factor = 1 - c * sigma_E * eta0 * inv_eps / 2
-
-        # standard update formula using lossless material
+        # XANADU: delta form. Collect the increment K (curl term plus any ADE term) and apply the lossy
+        # update below as E + (K - 2 * half * E) / (1 + half), never forming 1 - half. With float32
+        # materials and float64 fields, 1 - half rounds to exactly 1 for weak losses and they vanish.
+        # half is cast to the field's real dtype so 1 + half here and 1 - half in update_E_reverse stay exact
+        # inverses; the materials themselves stay in material_dtype.
         # Component-wise multiplication for diagonally anisotropic materials:
-        # E[i, x, y, z] = factor * E[i, x, y, z] + c * curl[i, x, y, z] * inv_eps[i, x, y, z]
-        E = factor * arrays.fields.E + c * curl * inv_eps
+        # K[i, x, y, z] = c * curl[i, x, y, z] * inv_eps[i, x, y, z]
+        K = c * curl * inv_eps
 
         # Dispersive (ADE) correction. Non-dispersive cells have c3 = 0, so P_hat =
         # c1*P_curr + c2*P_prev and (P_curr - P_hat) reduces to a purely historical
@@ -327,16 +324,18 @@ def update_E(
             # an explicit newaxis — skip the reshape so the HLO stays flat.
             P_hat = disp_c1 * P_curr + disp_c2 * P_prev + disp_c3 * arrays.fields.E
             delta = jnp.sum(P_curr - P_hat, axis=0)
-            E = E + inv_eps * delta
+            K = K + inv_eps * delta
             arrays = arrays.aset("fields->dispersive_P_prev", P_curr)
             arrays = arrays.aset("fields->dispersive_P_curr", P_hat)
-            if sigma_E is not None:
-                # lossy update formula. Noop for conductivity = 0; see Schneider 3.12
-                E = E / (1 + c * sigma_E * eta0 * inv_eps / 2)
-        elif sigma_E is not None:
+
+        if sigma_E is not None:
             # update formula for lossy material. Simplifies to Noop for conductivity = 0
-            # for details see Schneider, chapter 3.12
-            E = E / (1 + c * sigma_E * eta0 * inv_eps / 2)
+            # for details see Schneider, chapter 3.12. XANADU: delta form, see above; equal to
+            # ((1 - half) * E + K) / (1 + half).
+            half = (c * sigma_E * eta0 * inv_eps / 2).astype(jnp.finfo(arrays.fields.E.dtype).dtype)
+            E = arrays.fields.E + (K - 2 * half * arrays.fields.E) / (1 + half)
+        else:
+            E = arrays.fields.E + K
 
     else:
         # Full anisotropic case: expand inv_eps and sigma_E to (3, 3, Nx, Ny, Nz)
@@ -584,12 +583,13 @@ def update_E_reverse(
 
     if not inv_eps_is_full_tensor and not sigma_E_is_full_tensor:
         # Isotropic and diagonal anisotropic case
-        factor = 1
         if sigma_E is not None:
-            E = E * (1 + c * sigma_E * eta0 * inv_eps / 2)
-            factor = 1 - c * sigma_E * eta0 * inv_eps / 2
-
-        E = (E - c * curl * inv_eps) / factor
+            # XANADU: delta form, the exact inverse of update_E's: E0 = E1 + (2 * half * E1 - K) / (1 - half),
+            # equal to ((1 + half) * E1 - K) / (1 - half) without rounding half against a bare 1.
+            half = (c * sigma_E * eta0 * inv_eps / 2).astype(jnp.finfo(E.dtype).dtype)
+            E = E + (2 * half * E - c * curl * inv_eps) / (1 - half)
+        else:
+            E = E - c * curl * inv_eps
 
     else:
         # Full anisotropic case: expand inv_eps and sigma_E to (3, 3, Nx, Ny, Nz)
@@ -718,19 +718,15 @@ def update_H(
 
     if not inv_mu_is_full_tensor and not sigma_H_is_full_tensor:
         # Isotropic and diagonal anisotropic case
-        factor = 1
         if sigma_H is not None:
             # update formula for lossy material. Simplifies to Noop for conductivity = 0
-            # for details see Schneider, chapter 3.12
-            factor = 1 - c * sigma_H / eta0 * inv_mu / 2
-
-        # standard update formula for lossless material
-        H = factor * arrays.fields.H - c * curl * inv_mu
-
-        if sigma_H is not None:
-            # update formula for lossy material. Simplifies to NoOp for conductivity = 0
-            # for details see Schneider, chapter 3.12
-            H = H / (1 + c * sigma_H / eta0 * inv_mu / 2)
+            # for details see Schneider, chapter 3.12. XANADU: delta form as in update_E, with K = -c * curl * inv_mu;
+            # equal to ((1 - half) * H - c * curl * inv_mu) / (1 + half).
+            half = (c * sigma_H / eta0 * inv_mu / 2).astype(jnp.finfo(arrays.fields.H.dtype).dtype)
+            H = arrays.fields.H + (-c * curl * inv_mu - 2 * half * arrays.fields.H) / (1 + half)
+        else:
+            # standard update formula for lossless material
+            H = arrays.fields.H - c * curl * inv_mu
 
     else:
         # Full anisotropic case: expand inv_mu and sigma_H to (3, 3, Nx, Ny, Nz)
@@ -905,12 +901,13 @@ def update_H_reverse(
 
     if not inv_mu_is_full_tensor and not sigma_H_is_full_tensor:
         # Isotropic and diagonal anisotropic case
-        factor = 1
         if sigma_H is not None:
-            # lossy materials get gain when simulating backwards
-            H = H * (1 + c * sigma_H / eta0 * inv_mu / 2)
-            factor = 1 - c * sigma_H / eta0 * inv_mu / 2
-        H = (H + c * curl * inv_mu) / factor
+            # lossy materials get gain when simulating backwards. XANADU: delta form, the exact inverse of
+            # update_H's: H0 = H1 + (2 * half * H1 + c * curl * inv_mu) / (1 - half).
+            half = (c * sigma_H / eta0 * inv_mu / 2).astype(jnp.finfo(H.dtype).dtype)
+            H = H + (2 * half * H + c * curl * inv_mu) / (1 - half)
+        else:
+            H = H + c * curl * inv_mu
 
     else:
         # Full anisotropic case: expand inv_mu and sigma_H to (3, 3, Nx, Ny, Nz)
