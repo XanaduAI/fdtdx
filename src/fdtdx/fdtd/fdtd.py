@@ -109,6 +109,9 @@ def reversible_fdtd(
             recording_state=recording_state,
             electric_conductivity=arrays.electric_conductivity,
             magnetic_conductivity=arrays.magnetic_conductivity,
+            offdiag_inv_permittivities=arrays.offdiag_inv_permittivities,
+            offdiag_inv_permeabilities=arrays.offdiag_inv_permeabilities,
+            offdiag_z_start=arrays.offdiag_z_start,
         )
         state = reversible_fdtd_base(arr)
         return (
@@ -207,6 +210,9 @@ def reversible_fdtd(
             recording_state=res_recording_state,
             electric_conductivity=arrays.electric_conductivity,
             magnetic_conductivity=arrays.magnetic_conductivity,
+            offdiag_inv_permittivities=arrays.offdiag_inv_permittivities,
+            offdiag_inv_permeabilities=arrays.offdiag_inv_permeabilities,
+            offdiag_z_start=arrays.offdiag_z_start,
         )
 
         _, cot = eqxi.while_loop(
@@ -256,6 +262,9 @@ def reversible_fdtd(
             recording_state=recording_state,
             electric_conductivity=arrays.electric_conductivity,
             magnetic_conductivity=arrays.magnetic_conductivity,
+            offdiag_inv_permittivities=arrays.offdiag_inv_permittivities,
+            offdiag_inv_permeabilities=arrays.offdiag_inv_permeabilities,
+            offdiag_z_start=arrays.offdiag_z_start,
         )
         s_k = reversible_fdtd_base(arr)
 
@@ -331,6 +340,9 @@ def reversible_fdtd(
         recording_state=recording_state,
         electric_conductivity=arrays.electric_conductivity,
         magnetic_conductivity=arrays.magnetic_conductivity,
+        offdiag_inv_permittivities=arrays.offdiag_inv_permittivities,
+        offdiag_inv_permeabilities=arrays.offdiag_inv_permeabilities,
+        offdiag_z_start=arrays.offdiag_z_start,
     )
     return time_step, out_arrs
 

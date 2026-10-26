@@ -293,6 +293,19 @@ class ArrayContainer(TreeClass):
     #: field for magnetic conductivity terms. Defaults to None.
     magnetic_conductivity: jax.Array | None = None
 
+    #: Off-diagonal inverse permittivity entries (xy, xz, yx, yz, zx, zy) on the z slab starting at
+    #: ``offdiag_z_start``, shape (6, Nx, Ny, nz). They complete a diagonal ``inv_permittivities`` (shape (3, ...))
+    #: to a full tensor inside the slab and must be zero on its first and last layer. Lossless media only.
+    #: Defaults to None.
+    offdiag_inv_permittivities: jax.Array | None = None
+
+    #: Off-diagonal inverse permeability entries on the same slab, completing ``inv_permeabilities`` the same way.
+    #: Defaults to None.
+    offdiag_inv_permeabilities: jax.Array | None = None
+
+    #: First z index of the off-diagonal slab. Defaults to 0.
+    offdiag_z_start: int = 0
+
 
 # time step and arrays
 SimulationState = tuple[jax.Array, ArrayContainer]

@@ -18,6 +18,65 @@ from fdtdx.objects.boundaries.periodic import PeriodicBoundary
 from fdtdx.objects.detectors.detector import Detector
 
 
+#: (row, column) of the six off-diagonal entries in ``ArrayContainer.offdiag_inv_permittivities`` / ``_permeabilities``
+OFFDIAG_ENTRIES = ((0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1))
+
+
+def offdiag_slab_term(
+    offdiag: jax.Array,
+    curl: jax.Array,
+    z_start: int | jax.Array,
+    periodic_axes: tuple[bool, bool, bool],
+    electric: bool,
+) -> jax.Array:
+    """Off-diagonal part of ``inv_material @ curl`` on a z slab, shape (3, Nx, Ny, nz).
+
+    Uses the same four-point averaging as the full-tensor update in ``update_E`` / ``update_H``: entry (i, j) at
+    cell n is weighted by the curl component j at the four points around field i, with the tensor taken at n and at
+    the neighbour along i (n + e_i for E, n - e_i for H). Beyond the slab in z the tensor counts as zero, and along
+    x and y it wraps like the full-tensor path. The slab must not touch the first or last z layer of the volume.
+
+    Args:
+        offdiag (jax.Array): Off-diagonal entries in ``OFFDIAG_ENTRIES`` order, shape (6, Nx, Ny, nz)
+        curl (jax.Array): Full curl of H (for E) or of E (for H), shape (3, Nx, Ny, Nz)
+        z_start (int | jax.Array): First z index of the slab
+        periodic_axes (tuple[bool, bool, bool]): Periodic axes, as for ``pad_fields``
+        electric (bool): True for the E stencil, False for the H stencil
+
+    Returns:
+        jax.Array: The off-diagonal contribution to each field component inside the slab
+    """
+    _, nx, ny, nz = offdiag.shape
+    sign = 1 if electric else -1
+    curl = jax.lax.dynamic_slice_in_dim(curl, z_start - 1, nz + 2, axis=3)
+    for axis in (1, 2):
+        width = [(0, 0)] * 4
+        width[axis] = (1, 1)
+        curl = jnp.pad(curl, width, mode="wrap" if periodic_axes[axis - 1] else "constant")
+        offdiag = jnp.pad(offdiag, width, mode="wrap")
+    offdiag = jnp.pad(offdiag, ((0, 0), (0, 0), (0, 0), (1, 1)))
+
+    def shifted(array, *steps):
+        offset = [1, 1, 1]
+        for axis, step in steps:
+            offset[axis] += step
+        return array[..., offset[0] : offset[0] + nx, offset[1] : offset[1] + ny, offset[2] : offset[2] + nz]
+
+    terms = [jnp.zeros((nx, ny, nz), dtype=curl.dtype) for _ in range(3)]
+    for entry, (i, j) in zip(offdiag, OFFDIAG_ENTRIES):
+        k = curl[j]
+        near = shifted(entry) * (shifted(k) + shifted(k, (j, -sign)))
+        far = shifted(entry, (i, sign)) * (shifted(k, (i, sign)) + shifted(k, (i, sign), (j, -sign)))
+        terms[i] = terms[i] + (near + far) / 4
+    return jnp.stack(terms)
+
+
+def _add_on_slab(field: jax.Array, term: jax.Array, z_start: int | jax.Array) -> jax.Array:
+    """``field`` with ``term`` added on the z slab starting at ``z_start``."""
+    slab = jax.lax.dynamic_slice_in_dim(field, z_start, term.shape[3], axis=3)
+    return jax.lax.dynamic_update_slice_in_dim(field, slab + term, z_start, axis=3)
+
+
 def get_periodic_axes(objects: ObjectContainer) -> tuple[bool, bool, bool]:
     """Determines which axes have periodic boundary conditions.
 
@@ -90,6 +149,13 @@ def update_E(
         else:
             # standard update formula using lossless material
             E = arrays.E + c * curl * inv_eps
+
+        offdiag = getattr(arrays, "offdiag_inv_permittivities", None)
+        if offdiag is not None:
+            if sigma_E is not None:
+                raise NotImplementedError("offdiag_inv_permittivities needs lossless media (no electric_conductivity)")
+            term = offdiag_slab_term(offdiag, curl, arrays.offdiag_z_start, periodic_axes, electric=True)
+            E = _add_on_slab(E, c * term, arrays.offdiag_z_start)
 
     else:
         # Full anisotropic case: expand inv_eps and sigma_E to (3, 3, Nx, Ny, Nz)
@@ -189,6 +255,8 @@ def update_E_reverse(
     Returns:
         ArrayContainer: Updated ArrayContainer with reversed E field values
     """
+    if getattr(arrays, "offdiag_inv_permittivities", None) is not None:
+        raise NotImplementedError("the reverse E update does not support offdiag_inv_permittivities")
     E = arrays.E
     for source in objects.sources:
 
@@ -349,6 +417,13 @@ def update_H(
             # standard update formula for lossless material
             H = arrays.H - c * curl * inv_mu
 
+        offdiag = getattr(arrays, "offdiag_inv_permeabilities", None)
+        if offdiag is not None:
+            if sigma_H is not None:
+                raise NotImplementedError("offdiag_inv_permeabilities needs lossless media (no magnetic_conductivity)")
+            term = offdiag_slab_term(offdiag, curl, arrays.offdiag_z_start, periodic_axes, electric=False)
+            H = _add_on_slab(H, -c * term, arrays.offdiag_z_start)
+
     else:
         # Full anisotropic case: expand inv_mu and sigma_H to (3, 3, Nx, Ny, Nz)
         inv_mu = expand_to_3x3(inv_mu)
@@ -447,6 +522,8 @@ def update_H_reverse(
     Returns:
         ArrayContainer: Updated ArrayContainer with reversed H field values
     """
+    if getattr(arrays, "offdiag_inv_permeabilities", None) is not None:
+        raise NotImplementedError("the reverse H update does not support offdiag_inv_permeabilities")
     H = arrays.H
     for source in objects.sources:
 
